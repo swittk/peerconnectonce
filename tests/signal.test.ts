@@ -229,6 +229,53 @@ describe('MemoryPeerSessionStore', () => {
 });
 
 describe('framework-neutral HTTP signaling', () => {
+  it('round-trips namespaced store IDs through read, acknowledgement and cancellation', async () => {
+    const identifiers = ['offer.1', 'tenant:offer/2'];
+    let next = 0;
+    const store = new MemoryPeerSessionStore({
+      createId: () => identifiers[next++]!,
+    });
+    const handler = createPeerSignalHandler({
+      store,
+      authenticateClient: async () => ({ userId: 'alice' }),
+      authenticateNode: async () => ({ nodeId: 'node-a' }),
+      allowedProtocols: ['echo-v1'],
+      getIceServers: async () => [],
+    });
+    const fetchLocal: typeof fetch = async (input, init) =>
+      handler(new Request(String(input), init));
+    const browser = createHttpClientSignaling({
+      baseUrl: 'https://broker.example/peer',
+      headers: () => ({}),
+      fetch: fetchLocal,
+    });
+    const node = createHttpNodeSignaling({
+      baseUrl: 'https://broker.example/peer', nodeId: 'node-a',
+      headers: () => ({}), fetch: fetchLocal,
+    });
+
+    for (const identifier of identifiers) {
+      const created = await browser.createOffer({
+        nodeId: 'node-a', protocol: 'echo-v1', offerSdp: 'offer',
+      });
+      expect(created.sessionId).toBe(identifier);
+      expect(await browser.readAnswer(identifier)).toEqual({ status: 'pending' });
+      expect((await node.claim())?.sessionId).toBe(identifier);
+      await node.answer(identifier, 'answer');
+      expect(await browser.readAnswer(identifier)).toEqual({
+        status: 'answered', answerSdp: 'answer',
+      });
+      await browser.acknowledgeOffer?.(identifier);
+      await browser.cancelOffer?.(identifier);
+      expect(store.read(identifier, 'alice')).toBeUndefined();
+      await expect(browser.readAnswer(identifier)).rejects.toThrow('peer_signal_http_404');
+    }
+
+    // Malformed URL encoding must not leak into the store or become a server error.
+    const malformed = await handler(new Request('https://broker.example/peer/sessions/%GG'));
+    expect(malformed.status).toBe(400);
+  });
+
   it('connects authenticated browser and node clients with injection and node isolation', async () => {
     const handler = createPeerSignalHandler({
       authenticateClient: async (request) =>

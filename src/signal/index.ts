@@ -370,18 +370,19 @@ export function createPeerSignalHandler(options: PeerSignalHandlerOptions): (req
         const sessionId = await store.create({ nodeId: node, ownerUserId: user, protocol: body.protocol, offerSdp: body.offerSdp });
         return answer({ sessionId, iceServers }, 201);
       }
-      const acknowledgeMatch = /^sessions\/([a-zA-Z0-9_-]{1,128})\/ack$/.exec(route);
-      if (acknowledgeMatch && request.method === 'POST') {
+      const sessionRoute = /^sessions\/([^/]+)(\/ack)?$/.exec(route);
+      if (sessionRoute &&
+          (sessionRoute[2] ? request.method === 'POST'
+            : request.method === 'GET' || request.method === 'DELETE')) {
+        // Store implementations may issue namespaced IDs. The HTTP client
+        // encodes the ID as a single path segment; decode it only once here.
+        let id: string;
+        try { id = decodeURIComponent(sessionRoute[1]!); }
+        catch { return answer({ error: 'invalid_session_id' }, 400); }
+        if (!id || id.length > 128) return answer({ error: 'invalid_session_id' }, 400);
         const user = await browserUser();
         if (!user) return answer({ error: 'unauthorized' }, 401);
-        await store.acknowledge(acknowledgeMatch[1]!, user);
-        return empty();
-      }
-      const sessionMatch = /^sessions\/([a-zA-Z0-9_-]{1,128})$/.exec(route);
-      if (sessionMatch && (request.method === 'GET' || request.method === 'DELETE')) {
-        const user = await browserUser();
-        if (!user) return answer({ error: 'unauthorized' }, 401);
-        const id = sessionMatch[1]!;
+        if (sessionRoute[2]) { await store.acknowledge(id, user); return empty(); }
         if (request.method === 'DELETE') { await store.cancel(id, user); return empty(); }
         const status = await store.read(id, user);
         return status ? answer(status) : answer({ error: 'not_found' }, 404);

@@ -32,12 +32,12 @@ a capacity error rather than disrupting existing negotiation.
 The runtime has bounded data-channel queues and flow control, without an arbitrary
 bandwidth limit enabled by default. A bandwidth policy is opt-in.
 
-Underlying SCTP fragmentation and reassembly are delegated to Werift. The
-library bounds complete messages and application-level queues; it does **not**
-patch Werift's internal receive implementation or promise memory limits for
-incomplete messages from malicious connected peers. Deployments that accept
-untrusted peers should consider the upstream SCTP implementation's resource
-behavior separately.
+Underlying SCTP fragmentation and reassembly are delegated to Werift.
+`maxMessageBytes` rejects oversized messages **after** Werift has reassembled
+them; it does not bound Werift's memory use during reassembly, even for an
+eventually complete oversized message. Application-level queues remain bounded.
+Deployments accepting untrusted connected peers should assess this upstream
+SCTP resource behavior separately.
 
 ## Development
 
