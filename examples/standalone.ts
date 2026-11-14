@@ -1,5 +1,5 @@
 /**
- * Sketch of host integration, without importing any framework-specific authentication or service..
+ * Sketch of host integration, without importing any framework-specific authentication or service.
  * /signal can be mounted using standard Request/Response conversion;
  * this helper library never opens an unrestricted local HTTP proxy.
  */
@@ -37,7 +37,7 @@ const browser = new BrowserPeerClient({
     headers: () => YOUR_BROWSER_AUTH_HEADERS,
   }),
 });
-const opened = await browser.connect('echo-v1');
+const opened = await browser.connect('echo-v1', { nodeId: 'node-a' });
 opened.channel.send('hello');
 
 // Placeholder symbols intentionally belong to each embedding application.

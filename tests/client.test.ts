@@ -156,6 +156,56 @@ describe('shared browser WebRTC connection lifecycle', () => {
     }
   });
 
+  it('keeps omitted node discovery distinct from explicit default node in pending and active reuse', async () => {
+    let unblock: (() => void) | undefined;
+    const holdOffer = new Promise<void>((resolve) => { unblock = resolve; });
+    const seen: (string | undefined)[] = [];
+    const client = new PeerClient({
+      signaling: {
+        getIceServers: async () => [],
+        createOffer: async ({ nodeId }) => {
+          seen.push(nodeId);
+          await holdOffer;
+          return { sessionId: 'offer', iceServers: [] };
+        },
+        readAnswer: async () => ({ status: 'answered', answerSdp: 'answer' }),
+      },
+      createPeerConnection: () => new FakePeer() as unknown as ClientPeerConnection,
+    });
+    const pending = client.connect('read-v1');
+    await expect(client.connect('read-v1', { nodeId: 'default' })).rejects.toThrow('peer_client_in_use');
+    unblock?.();
+    await pending;
+    await expect(client.connect('read-v1', { nodeId: 'default' })).rejects.toThrow('peer_client_in_use');
+    expect(seen).toEqual([undefined]);
+    client.close();
+  });
+
+  it('bounds a stalled late-ICE cancel within the original connection deadline and aborts DELETE', async () => {
+    let wasAborted = false;
+    const client = new PeerClient({
+      connectionTimeoutMs: 65,
+      signaling: {
+        getIceServers: async () => [],
+        createOffer: async () => ({
+          sessionId: 'late-ice-offer',
+          iceServers: [{ urls: 'turn:node.example:3478' }],
+        }),
+        readAnswer: async () => ({ status: 'pending' }),
+        cancelOffer: async (_id, signal) => {
+          signal?.addEventListener('abort', () => { wasAborted = true; }, { once: true });
+          return new Promise<void>(() => undefined);
+        },
+      },
+      createPeerConnection: () => new FakePeer() as unknown as ClientPeerConnection,
+    });
+    const started = Date.now();
+    await expect(client.connect('read-v1')).rejects.toThrow('peer_timeout:late_ice_cancel');
+    expect(Date.now() - started).toBeLessThan(300);
+    expect(wasAborted).toBe(true);
+    client.close();
+  });
+
   it('does not leave an indefinite pending negotiation when the node never answers', async () => {
     let cancelCount = 0;
     const client = new PeerClient({

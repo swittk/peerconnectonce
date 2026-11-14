@@ -32,6 +32,8 @@ type StoredSession = PeerOffer & {
 /** Single-process store; applications requiring HA inject their own store instead. */
 export class MemoryPeerSessionStore implements PeerSessionStore {
   private readonly sessions = new Map<string, StoredSession>();
+  /** Skip full-store expiry sweeps until an actual session deadline is due. */
+  private nextSweepAtMs = Infinity;
   private readonly now: () => number;
   private readonly createId: () => string;
   private readonly ttlMs: number;
@@ -50,14 +52,21 @@ export class MemoryPeerSessionStore implements PeerSessionStore {
 
   private expire(): void {
     const now = this.now();
+    if (now < this.nextSweepAtMs) return;
+    let nextSweepAtMs = Infinity;
     for (const [id, session] of this.sessions) {
       if (session.deleteAt <= now) {
         this.sessions.delete(id);
-      } else if (session.status.status === 'pending' && session.expiresAt <= now) {
+        continue;
+      }
+      if (session.status.status === 'pending' && session.expiresAt <= now) {
         session.offerSdp = '';
         session.status = { status: 'failed' };
       }
+      const deadline = session.status.status === 'pending' ? session.expiresAt : session.deleteAt;
+      if (deadline < nextSweepAtMs) nextSweepAtMs = deadline;
     }
+    this.nextSweepAtMs = nextSweepAtMs;
   }
 
   create(args: { nodeId: string; ownerUserId: string; protocol: string; offerSdp: string }): string {
@@ -76,6 +85,7 @@ export class MemoryPeerSessionStore implements PeerSessionStore {
       ...args, sessionId, claimed: false, status: { status: 'pending' },
       expiresAt: now + this.ttlMs, deleteAt: now + this.ttlMs + this.retentionMs,
     });
+    if (now + this.ttlMs < this.nextSweepAtMs) this.nextSweepAtMs = now + this.ttlMs;
     return sessionId;
   }
 
@@ -106,6 +116,7 @@ export class MemoryPeerSessionStore implements PeerSessionStore {
     session.status = result.failed ? { status: 'failed' } : { status: 'answered', answerSdp: result.answerSdp! };
     session.offerSdp = '';
     session.deleteAt = this.now() + this.retentionMs;
+    if (session.deleteAt < this.nextSweepAtMs) this.nextSweepAtMs = session.deleteAt;
     return true;
   }
 
@@ -113,9 +124,9 @@ export class MemoryPeerSessionStore implements PeerSessionStore {
     this.expire();
     const session = this.sessions.get(sessionId);
     if (!session || session.ownerUserId !== ownerUserId) return;
-    session.status = { status: 'failed' };
-    session.offerSdp = '';
-    session.deleteAt = this.now() + this.retentionMs;
+    // Explicit cancellation needs no retained SDP/status row. Immediate deletion
+    // frees capacity and fences an in-flight node answer without another scan.
+    this.sessions.delete(sessionId);
   }
 }
 

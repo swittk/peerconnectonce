@@ -44,7 +44,24 @@ describe('MemoryPeerSessionStore', () => {
     store.cancel(b, 'another-user');
     expect(store.read(b, 'u')).toEqual({ status: 'pending' });
     store.cancel(b, 'u');
-    expect(store.read(b, 'u')).toEqual({ status: 'failed' });
+    expect(store.read(b, 'u')).toBeUndefined();
+    expect(store.answer('node', b, { answerSdp: 'too-late' })).toBe(false);
+  });
+
+  it('allows repeated cancellation without exhausting global retained-session capacity', () => {
+    let counter = 0;
+    const store = new MemoryPeerSessionStore({
+      createId: () => 'cancel-' + ++counter,
+      maxSessions: 2, maxPendingPerUser: 1,
+      ttlMs: 60_000, retentionMs: 60_000,
+    });
+    for (let index = 0; index < 20; index++) {
+      const id = store.create({ nodeId: 'node', ownerUserId: 'u', protocol: 'read-v1', offerSdp: 'offer' });
+      store.cancel(id, 'u');
+      expect(store.read(id, 'u')).toBeUndefined();
+      expect(store.claim('node')).toBeUndefined();
+    }
+    expect(counter).toBe(20);
   });
 });
 

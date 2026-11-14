@@ -188,7 +188,7 @@ export class PeerClient {
     if (this.permanentlyClosed) throw new Error('peer_client_closed');
     if (options.signal?.aborted) throw new Error('peer_aborted');
     if (!isPeerLabel(protocol)) throw new Error('invalid_peer_protocol');
-    const requestedNodeId = options.nodeId ?? 'default';
+    const requestedNodeId = options.nodeId;
     if (this.active?.channel.readyState === 'open') {
       if (this.active.protocol !== protocol || this.activeNodeId !== requestedNodeId)
         throw new Error('peer_client_in_use');
@@ -274,8 +274,29 @@ export class PeerClient {
       // TURN after a host-only offer, that SDP cannot be retrofitted: make one fresh offer.
       const sessionIce = readPeerIceServers(session.iceServers);
       if (canRetryLateIce && sessionIce.length > 0 && !sameIceServers(ice, sessionIce)) {
-        try { await this.signaling.cancelOffer?.(sessionId, signal); } catch { /* expiration also fences it */ }
+        // This one-shot cancellation is already accounted for below; a failure
+        // must not trigger a second unbounded request in the outer catch.
+        const supersededSessionId = sessionId;
         sessionId = undefined;
+        // Bound this request by the same connection deadline. Its own AbortController
+        // stops a stalled HTTP DELETE without prematurely terminating the new offer.
+        if (this.signaling.cancelOffer) {
+          const cancelController = new AbortController();
+          const cancelForParent = () => cancelController.abort();
+          signal.addEventListener('abort', cancelForParent, { once: true });
+          try {
+            await underDeadline(
+              this.signaling.cancelOffer(supersededSessionId, cancelController.signal),
+              deadline, signal, 'late_ice_cancel'
+            );
+          } catch {
+            cancelController.abort();
+            // An orphaned offer still expires under the signaling store's TTL.
+          } finally {
+            signal.removeEventListener('abort', cancelForParent);
+          }
+        }
+        if (Date.now() >= deadline) throw new Error('peer_timeout:late_ice_cancel');
         closeAttempt();
         return this.open(protocol, nodeId, controller, sessionIce, deadline, false);
       }
@@ -296,7 +317,7 @@ export class PeerClient {
       channel.addEventListener('close', close, { once: true });
       const result: PeerClientConnectionHandle = { protocol, channel, signal, close };
       this.active = result;
-      this.activeNodeId = nodeId ?? 'default';
+      this.activeNodeId = nodeId;
       signal.addEventListener('abort', () => {
         if (this.active === result) {
           this.active = undefined;

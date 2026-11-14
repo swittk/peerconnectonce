@@ -1,4 +1,5 @@
 import { RTCPeerConnection, type RTCDataChannel } from 'werift';
+import type { PeerIceServer } from '../shared/contracts.js';
 import {
   isPeerLabel, type PeerNodeSignaling, type PeerOffer,
 } from '../shared/contracts.js';
@@ -36,7 +37,7 @@ export type PeerServiceRegistration = {
 export type PeerServerOptions = {
   signaling: PeerNodeSignaling;
   services: readonly PeerServiceRegistration[];
-  iceServers: RTCIceServer[];
+  iceServers: PeerIceServer[];
   pollIntervalMs?: number;
   maxPeers?: number;
   setupTimeoutMs?: number;
@@ -46,10 +47,20 @@ export type PeerServerOptions = {
   bufferedLowBytes?: number;
   /** Bounds unsent messages held by our promise queue. */
   maxQueuedBytes?: number;
+  /** Independent entry-count bound even for empty data-channel messages. */
+  maxQueuedMessages?: number;
   maxMessageBytes?: number;
   /** Opt-in QoS only; undefined/0 runs without artificial bandwidth pacing. */
   outgoingBytesPerSecond?: number;
   onError?: (error: Error) => void;
+};
+
+/** Versioned/reliable channel metadata; callers need no Werift-specific declarations. */
+export type PeerChannelDescriptor = {
+  readonly label: string;
+  readonly ordered: boolean;
+  readonly maxRetransmits?: number | null;
+  readonly maxPacketLifeTime?: number | null;
 };
 
 /** A generic service allowlist. No arbitrary browser label can invoke a local service. */
@@ -69,7 +80,7 @@ export class PeerServiceRegistry {
 
   has(label: string): boolean { return this.registrations.has(label); }
 
-  create(channel: RTCDataChannel, context: PeerServiceContext): PeerServiceSession {
+  create(channel: PeerChannelDescriptor, context: PeerServiceContext): PeerServiceSession {
     if (channel.label !== context.protocol || !this.registrations.has(channel.label) ||
         !channel.ordered || channel.maxRetransmits != null || channel.maxPacketLifeTime != null) {
       throw new Error('unregistered_or_unreliable_peer_channel');
@@ -82,25 +93,37 @@ export type PeerWriterOptions = {
   highBytes?: number;
   lowBytes?: number;
   maxQueuedBytes?: number;
+  /** Independent entry-count bound even for empty data-channel messages. */
+  maxQueuedMessages?: number;
   maxMessageBytes?: number;
   outgoingBytesPerSecond?: number;
   signal?: AbortSignal;
 };
 
-type WritableChannel = Pick<
-  RTCDataChannel,
-  'readyState' | 'bufferedAmount' | 'bufferedAmountLowThreshold' | 'bufferedAmountLow' | 'send' | 'close'
->;
+/** Minimal writable Node data-channel surface; no Werift types leak into public .d.ts. */
+type WritableChannel = {
+  readonly readyState: 'connecting' | 'open' | 'closing' | 'closed';
+  readonly bufferedAmount: number;
+  bufferedAmountLowThreshold: number;
+  readonly bufferedAmountLow: {
+    subscribe(callback: () => void): { unSubscribe(): void };
+  };
+  send(message: string | Buffer): void;
+  close(): void;
+};
 
 /** Bounded writer shared by every service. No default outgoing rate limiter. */
 export class BoundedPeerWriter implements PeerChannelWriter {
   private tail = Promise.resolve();
   private queuedBytes = 0;
+  private queuedMessages = 0;
   private closed = false;
+  private readonly stop = new AbortController();
   private nextSendAt = 0;
   private readonly high: number;
   private readonly low: number;
   private readonly maxQueued: number;
+  private readonly maxQueuedMessages: number;
   private readonly maxFrame: number;
   private readonly rate: number;
 
@@ -108,9 +131,11 @@ export class BoundedPeerWriter implements PeerChannelWriter {
     this.high = options.highBytes ?? 4 * 1024 * 1024;
     this.low = options.lowBytes ?? 1024 * 1024;
     this.maxQueued = options.maxQueuedBytes ?? 8 * 1024 * 1024;
+    this.maxQueuedMessages = options.maxQueuedMessages ?? 1024;
     this.maxFrame = options.maxMessageBytes ?? 64 * 1024;
     this.rate = options.outgoingBytesPerSecond ?? 0;
     if (this.high <= this.low || this.low < 0 || this.maxQueued <= 0 || this.maxFrame <= 0 ||
+        !Number.isSafeInteger(this.maxQueuedMessages) || this.maxQueuedMessages < 1 ||
         !Number.isFinite(this.rate) || this.rate < 0) throw new Error('invalid_peer_writer_limits');
     channel.bufferedAmountLowThreshold = this.low;
     options.signal?.addEventListener('abort', () => this.close(), { once: true });
@@ -126,18 +151,23 @@ export class BoundedPeerWriter implements PeerChannelWriter {
 
   private enqueue(message: string | Buffer, size: number): Promise<void> {
     if (this.closed || this.channel.readyState !== 'open') return Promise.reject(new Error('peer_channel_closed'));
-    if (size > this.maxFrame || this.queuedBytes + size > this.maxQueued) {
+    if (size > this.maxFrame || this.queuedBytes + size > this.maxQueued ||
+        this.queuedMessages >= this.maxQueuedMessages) {
       return Promise.reject(new Error('peer_writer_capacity'));
     }
     this.queuedBytes += size;
+    this.queuedMessages++;
     const send = this.tail.then(async () => {
+      if (this.closed) throw new Error('peer_channel_closed');
       await this.waitForBuffer();
       if (this.rate > 0) await this.waitForOptionalRate(size);
       if (this.closed || this.channel.readyState !== 'open') throw new Error('peer_channel_closed');
       this.channel.send(message);
+    }).finally(() => {
+      this.queuedBytes -= size;
+      this.queuedMessages--;
     });
     this.tail = send.catch(() => undefined);
-    void send.finally(() => { this.queuedBytes -= size; }).catch(() => undefined);
     return send;
   }
 
@@ -151,28 +181,47 @@ export class BoundedPeerWriter implements PeerChannelWriter {
           if (settled) return;
           settled = true;
           clearTimeout(timeout);
+          this.stop.signal.removeEventListener('abort', finish);
           subscription?.unSubscribe();
           resolve();
         };
         const timeout = setTimeout(finish, 250);
+        this.stop.signal.addEventListener('abort', finish, { once: true });
         subscription = this.channel.bufferedAmountLow.subscribe(finish);
         if (settled) subscription.unSubscribe();
       });
     }
   }
 
-  /** Only if explicitly configured: paced bursts, no one-timer-per-frame default. */
+  /** Optional operator pacing, with one cancellable timer only when a real delay is needed. */
   private async waitForOptionalRate(bytes: number): Promise<void> {
+    if (this.closed) throw new Error('peer_channel_closed');
     const now = performance.now();
     const at = Math.max(now, this.nextSendAt);
-    // Accumulate fractional waits; only sleep when a meaningful interval has accrued.
-    if (at - now >= 8) await new Promise((resolve) => setTimeout(resolve, at - now));
+    // Accumulate fractional waits instead of scheduling a timer per small frame.
+    if (at - now >= 8) {
+      await new Promise<void>((resolve) => {
+        let finished = false;
+        const end = () => {
+          if (finished) return;
+          finished = true;
+          clearTimeout(timer);
+          this.stop.signal.removeEventListener('abort', end);
+          resolve();
+        };
+        const timer = setTimeout(end, at - now);
+        this.stop.signal.addEventListener('abort', end, { once: true });
+        if (this.stop.signal.aborted) end();
+      });
+    }
+    if (this.closed) throw new Error('peer_channel_closed');
     this.nextSendAt = at + (bytes / this.rate) * 1000;
   }
 
   close(): void {
     if (this.closed) return;
     this.closed = true;
+    this.stop.abort();
     if (this.channel.readyState === 'open' || this.channel.readyState === 'connecting') this.channel.close();
   }
 }
@@ -303,8 +352,10 @@ export class PeerServer {
     };
     let idleCheck: ReturnType<typeof setInterval> | undefined;
     let queuedIncomingBytes = 0;
+    let queuedIncomingMessages = 0;
     let incomingTail = Promise.resolve();
     const maxIncomingQueueBytes = this.options.maxQueuedBytes ?? 8 * 1024 * 1024;
+    const maxIncomingMessages = this.options.maxQueuedMessages ?? 1024;
     const maxIncomingFrameBytes = this.options.maxMessageBytes ?? 64 * 1024;
     const close = async () => {
       if (alreadyClosed) return;
@@ -333,6 +384,7 @@ export class PeerServer {
         highBytes: this.options.bufferedHighBytes,
         lowBytes: this.options.bufferedLowBytes,
         maxQueuedBytes: this.options.maxQueuedBytes,
+        maxQueuedMessages: this.options.maxQueuedMessages,
         maxMessageBytes: this.options.maxMessageBytes,
         outgoingBytesPerSecond: this.options.outgoingBytesPerSecond,
         signal: controller.signal,
@@ -351,16 +403,23 @@ export class PeerServer {
       // Ordered transport must also preserve service execution order after asynchronous writes.
       // Bound retained JS payloads independently of SCTP bufferedAmount.
       openedChannel.onMessage.subscribe((message) => {
+        if (alreadyClosed || controller.signal.aborted) return;
         const bytes = typeof message === 'string' ? Buffer.byteLength(message) : message.byteLength;
-        if (bytes > maxIncomingFrameBytes || queuedIncomingBytes + bytes > maxIncomingQueueBytes) {
+        if (bytes > maxIncomingFrameBytes || queuedIncomingBytes + bytes > maxIncomingQueueBytes ||
+            queuedIncomingMessages >= maxIncomingMessages) {
           void close();
           return;
         }
         queuedIncomingBytes += bytes;
+        queuedIncomingMessages++;
         const done = markWork();
-        const next = incomingTail.then(() => session?.receiveMessage(message));
-        incomingTail = next.catch(() => void close()).then(() => {
+        const next = incomingTail.then(() => {
+          if (alreadyClosed || controller.signal.aborted) return;
+          return session?.receiveMessage(message);
+        });
+        incomingTail = next.catch(() => { void close(); }).then(() => {
           queuedIncomingBytes -= bytes;
+          queuedIncomingMessages--;
           done();
         });
       });
@@ -373,18 +432,24 @@ export class PeerServer {
 
     try {
       const deadline = Date.now() + this.options.setupTimeoutMs;
-      await beforeDeadline(connection.setRemoteDescription({ type: 'offer', sdp: offer.offerSdp }), deadline, shutdownSignal);
-      const answer = await beforeDeadline(connection.createAnswer(), deadline, shutdownSignal);
-      await beforeDeadline(connection.setLocalDescription(answer), deadline, shutdownSignal);
+      await beforeDeadline(connection.setRemoteDescription({ type: 'offer', sdp: offer.offerSdp }), deadline, controller.signal);
+      const answer = await beforeDeadline(connection.createAnswer(), deadline, controller.signal);
+      await beforeDeadline(connection.setLocalDescription(answer), deadline, controller.signal);
       const sdp = connection.localDescription?.sdp;
       if (!sdp) throw new Error('peer_answer_missing');
-      await beforeDeadline(this.options.signaling.answer(offer.sessionId, sdp, shutdownSignal), deadline, shutdownSignal);
+      await beforeDeadline(this.options.signaling.answer(offer.sessionId, sdp, controller.signal), deadline, controller.signal);
     } catch (error) {
       await close();
       if (!shutdownSignal.aborted) await this.options.signaling.fail(offer.sessionId, shutdownSignal).catch(() => undefined);
       throw error;
     }
 
+    // A peer may have closed while its answer was being published. Never leak an
+    // idle interval after cleanup already ran.
+    if (alreadyClosed || controller.signal.aborted) {
+      await close();
+      throw new Error('peer_setup_stopped');
+    }
     idleCheck = setInterval(() => {
       if (!channel || !session || channel.readyState !== 'open') {
         // Setup is not inactivity: the peer is not idle until its service channel opens.
@@ -403,7 +468,9 @@ export { PeerServer as PeerGatewayOnce };
 export type HttpNodeSignalingOptions = {
   baseUrl: string;
   nodeId: string;
-  headers: () => HeadersInit | Promise<HeadersInit>;
+  /** Node Fetch headers, without depending on browser-only DOM type declarations. */
+  headers: () => Record<string, string> | Headers | [string, string][] |
+    Promise<Record<string, string> | Headers | [string, string][]>;
   fetch?: typeof fetch;
   requestTimeoutMs?: number;
 };
@@ -411,18 +478,26 @@ export type HttpNodeSignalingOptions = {
 export function createHttpNodeSignaling(options: HttpNodeSignalingOptions): PeerNodeSignaling {
   const fetchImpl = options.fetch ?? fetch;
   const base = options.baseUrl.replace(/\/$/, '');
-  async function request(path: string, signal?: AbortSignal, body?: object): Promise<Response> {
+  async function request(
+    path: string, signal?: AbortSignal, body?: object, expectJson = false
+  ): Promise<{ status: number; payload?: unknown }> {
     const controller = new AbortController();
     const stop = () => controller.abort();
     signal?.addEventListener('abort', stop, { once: true });
+    if (signal?.aborted) controller.abort();
     const timer = setTimeout(stop, options.requestTimeoutMs ?? 15_000);
     try {
       const headers = new Headers(await options.headers());
       if (body) headers.set('content-type', 'application/json');
-      return await fetchImpl(base + path, {
+      const response = await fetchImpl(base + path, {
         method: body ? 'POST' : 'GET', headers, signal: controller.signal,
         ...(body ? { body: JSON.stringify(body) } : {}),
       });
+      // Keep timeout/shutdown attached while consuming the response body, not
+      // merely while the remote endpoint is sending headers.
+      const payload = expectJson && response.ok && response.status !== 204
+        ? await response.json() as unknown : undefined;
+      return { status: response.status, payload };
     } finally {
       clearTimeout(timer);
       signal?.removeEventListener('abort', stop);
@@ -430,11 +505,11 @@ export function createHttpNodeSignaling(options: HttpNodeSignalingOptions): Peer
   }
   return {
     async claim(signal) {
-      const response = await request('/claim?nodeId=' + encodeURIComponent(options.nodeId), signal);
+      const response = await request('/claim?nodeId=' + encodeURIComponent(options.nodeId), signal, undefined, true);
       if (response.status === 204) return undefined;
-      if (!response.ok) throw new Error('peer_claim_http_' + response.status);
-      const offer = await response.json() as PeerOffer;
-      if (offer.nodeId !== options.nodeId || !isPeerLabel(offer.protocol) ||
+      if (response.status < 200 || response.status >= 300) throw new Error('peer_claim_http_' + response.status);
+      const offer = response.payload as PeerOffer;
+      if (!offer || typeof offer !== 'object' || offer.nodeId !== options.nodeId || !isPeerLabel(offer.protocol) ||
           typeof offer.offerSdp !== 'string' || !offer.sessionId || !offer.ownerUserId)
         throw new Error('peer_claim_invalid');
       return offer;

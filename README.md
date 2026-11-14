@@ -30,7 +30,11 @@ bandwidth limit enabled by default. A bandwidth policy is opt-in.
 Run pnpm check to typecheck, test, build ESM and CommonJS, and check all four
 self-referencing package entrypoints.
 
-Run pnpm smoke:browser to test a real Chromium-to-Werift roundtrip. Playwright
-is a test-only dependency and is not included in the library artifact.
+Run pnpm smoke:browser to test a real Chromium-to-Werift roundtrip. This
+optional smoke test requires Playwright and a matching Chromium browser in
+the test environment; neither is a package runtime dependency. Install
+Playwright in an external QA project (for example: pnpm add -D playwright,
+then pnpm exec playwright install chromium), and make it resolvable from
+this repository or set PEERCONNECTONCE_PLAYWRIGHT to its absolute module path.
 
 Package publication is intentionally disabled until separately authorized.

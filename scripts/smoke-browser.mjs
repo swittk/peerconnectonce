@@ -66,6 +66,7 @@ const server = createServer(async (request, response) => {
 });
 
 const shutdown = new AbortController();
+const receivedMessages = [];
 let browser;
 try {
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -82,11 +83,18 @@ try {
         async receiveMessage(message) {
           const release = beginWork();
           try {
+            const text = String(message);
+            receivedMessages.push(text);
+            if (text === 'fail-first') {
+              // The next wire message must be queued before this failure closes the session.
+              await new Promise((resolve) => setTimeout(resolve, 150));
+              throw new Error('intentional_adapter_failure');
+            }
             // A long-running registered service must outlive an idle timeout.
-            if (String(message) === 'slow') {
+            if (text === 'slow') {
               await new Promise((resolve) => setTimeout(resolve, 3500));
             }
-            await writer.sendText('echo:' + String(message));
+            await writer.sendText('echo:' + text);
           } finally {
             release();
           }
@@ -141,7 +149,38 @@ try {
       result.state !== 'open' || !result.idleClosed || result.closed !== 'closed') {
     throw new Error('unexpected browser/werift echo: ' + JSON.stringify(result));
   }
-  console.log('PEERCONNECTONCE_BROWSER_WERIFT_PASS', JSON.stringify(result));
+  // The ordered transport must not process queued service B after handler A
+  // failed and closed the session, even if both frames arrived before close.
+  const failedSessionClosed = await page.evaluate(async (base) => {
+    const { BrowserPeerClient, createHttpBrowserSignaling } = await import('/dist/browser/index.js');
+    const client = new BrowserPeerClient({
+      signaling: createHttpBrowserSignaling({
+        baseUrl: base + '/peer',
+        headers: () => ({ 'x-test-user': 'alice' }),
+      }),
+      connectionTimeoutMs: 20_000,
+    });
+    const opened = await client.connect('echo-v1');
+    const closed = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('failed_adapter_did_not_close')), 5_000);
+      opened.channel.addEventListener('close', () => {
+        clearTimeout(timer);
+        resolve(true);
+      }, { once: true });
+    });
+    opened.channel.send('fail-first');
+    opened.channel.send('must-not-process');
+    const didClose = await closed;
+    client.close();
+    return didClose;
+  }, origin);
+  if (!failedSessionClosed || receivedMessages.includes('must-not-process') ||
+      !receivedMessages.includes('fail-first')) {
+    throw new Error('queued service was invoked after peer close: ' + JSON.stringify(receivedMessages));
+  }
+  console.log('PEERCONNECTONCE_BROWSER_WERIFT_PASS', JSON.stringify({
+    ...result, queuedMessagesSkippedAfterFailure: true,
+  }));
   shutdown.abort();
   await running;
 } finally {
