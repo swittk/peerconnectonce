@@ -32,17 +32,12 @@ a capacity error rather than disrupting existing negotiation.
 The runtime has bounded data-channel queues and flow control, without an arbitrary
 bandwidth limit enabled by default. A bandwidth policy is opt-in.
 
-The Node server also guards **incoming Werift 0.27 SCTP fragments before reassembly**.
-This is distinct from the completed-message queue limits: it checks the SCTP
-receive window, an independent cumulative incomplete-message byte budget, and
-per-message fragment and size limits. A violating peer is closed. This uses
-Werift 0.27.0's version-specific receive interface, checked during session setup.
-The optional server peer dependency is pinned to **exactly Werift 0.27.0**; upgrades
-require explicit review of the SCTP implementation and re-running the ingress
-regressions. An incompatible runtime receive surface fails closed rather than
-silently disabling protection. The guard uses O(1) neighboring-TSN checks to
-enforce fragment boundaries consistent with Werift's actual reassembly, and
-does not add repeated scans to incoming fragment admission.
+Underlying SCTP fragmentation and reassembly are delegated to Werift. The
+library bounds complete messages and application-level queues; it does **not**
+patch Werift's internal receive implementation or promise memory limits for
+incomplete messages from malicious connected peers. Deployments that accept
+untrusted peers should consider the upstream SCTP implementation's resource
+behavior separately.
 
 ## Development
 

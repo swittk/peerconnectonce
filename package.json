@@ -68,7 +68,7 @@
     "check": "pnpm typecheck && pnpm test && pnpm build && node scripts/check-exports.mjs && node scripts/check-es2018.mjs && node scripts/check-node-types.mjs"
   },
   "peerDependencies": {
-    "werift": "0.27.0"
+    "werift": "^0.27.0"
   },
   "peerDependenciesMeta": {
     "werift": {
