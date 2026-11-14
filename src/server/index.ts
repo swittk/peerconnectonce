@@ -277,6 +277,8 @@ export class PeerServer {
     'pollIntervalMs' | 'maxPeers' | 'setupTimeoutMs' | 'idleTimeoutMs'
   >> & PeerServerOptions;
   private readonly livePeers = new Map<string, RunningPeer>();
+  /** Reservations include peers still negotiating; Set admission is O(1). */
+  private readonly reservedPeerIds = new Set<string>();
   private running = false;
 
   constructor(options: PeerServerOptions) {
@@ -318,7 +320,7 @@ export class PeerServer {
     this.running = true;
     try {
       while (!shutdownSignal.aborted) {
-        if (this.livePeers.size >= this.options.maxPeers) {
+        if (this.reservedPeerIds.size >= this.options.maxPeers) {
           await delay(this.options.pollIntervalMs, shutdownSignal);
           continue;
         }
@@ -329,11 +331,16 @@ export class PeerServer {
               await this.options.signaling.fail(offer.sessionId, shutdownSignal);
               continue;
             }
-            const peer = await this.accept(offer, shutdownSignal);
-            this.livePeers.set(offer.sessionId, peer);
-            void peer.finished.finally(() => {
-              this.livePeers.delete(offer.sessionId);
-            });
+            try {
+              await this.accept(offer, shutdownSignal);
+            } catch (error) {
+              // Direct admission can fill the last slot while claim() awaits.
+              // Notify that already-claimed offer instead of leaving it pending.
+              if (error instanceof Error && error.message === 'peer_capacity') {
+                await this.options.signaling.fail(offer.sessionId, shutdownSignal).catch(() => undefined);
+              }
+              throw error;
+            }
           } else {
             await delay(this.options.pollIntervalMs, shutdownSignal);
           }
@@ -358,12 +365,23 @@ export class PeerServer {
   async accept(offer: PeerOffer, shutdownSignal: AbortSignal): Promise<RunningPeer> {
     if (shutdownSignal.aborted) throw new Error('peer_setup_stopped');
     if (!this.registry.has(offer.protocol)) throw new Error('unregistered_peer_service');
+    if (this.reservedPeerIds.size >= this.options.maxPeers ||
+        this.reservedPeerIds.has(offer.sessionId)) throw new Error('peer_capacity');
+    // Reserve synchronously before the first await, shared by direct accept()
+    // and the outbound claim loop. Failed setup/close releases the reservation.
+    this.reservedPeerIds.add(offer.sessionId);
+    let connection: RTCPeerConnection;
+    try {
+      connection = new RTCPeerConnection({
+        iceServers: this.options.iceServers,
+        iceUseDefaultStunServer: false,
+        maxMessageSize: this.options.maxMessageBytes ?? 64 * 1024,
+      });
+    } catch (error) {
+      this.reservedPeerIds.delete(offer.sessionId);
+      throw error;
+    }
     const controller = new AbortController();
-    const connection = new RTCPeerConnection({
-      iceServers: this.options.iceServers,
-      iceUseDefaultStunServer: false,
-      maxMessageSize: this.options.maxMessageBytes ?? 64 * 1024,
-    });
     let activeWork = 0;
     let lastActivity = Date.now();
     let channel: RTCDataChannel | undefined;
@@ -403,6 +421,8 @@ export class PeerServer {
           try { if (channel?.readyState === 'open') channel.close(); } catch { /* already closed */ }
           try { await connection.close(); } catch { /* already closed */ }
         } finally {
+          this.livePeers.delete(offer.sessionId);
+          this.reservedPeerIds.delete(offer.sessionId);
           finishedCallback();
         }
       })();
@@ -497,10 +517,20 @@ export class PeerServer {
         if (Date.now() - lastActivity >= this.options.setupTimeoutMs) void close();
         return;
       }
-      if (activeWork > 0 || session.hasActiveWork?.()) return;
+      if (activeWork > 0) return;
+      try {
+        if (session.hasActiveWork?.()) return;
+      } catch {
+        // A malformed adapter must not throw out of a timer and crash Node.
+        // Match receiveMessage's failure isolation by closing only this peer.
+        void close();
+        return;
+      }
       if (Date.now() - lastActivity >= this.options.idleTimeoutMs) void close();
     }, Math.min(1000, this.options.idleTimeoutMs));
-    return { close, finished };
+    const running = { close, finished };
+    this.livePeers.set(offer.sessionId, running);
+    return running;
   }
 }
 
@@ -537,11 +567,18 @@ export function createHttpNodeSignaling(options: HttpNodeSignalingOptions): Peer
         method: body ? 'POST' : 'GET', headers, signal: controller.signal,
         ...(body ? { body: JSON.stringify(body) } : {}),
       });
-      // Keep timeout/shutdown attached while consuming the response body, not
-      // merely while the remote endpoint is sending headers.
-      const payload = expectJson && response.ok && response.status !== 204
-        ? await response.json() as unknown : undefined;
-      return { status: response.status, payload };
+      // Keep timeout/shutdown attached through body handling. Parsed JSON
+      // consumes its stream; every other response must cancel its unread body
+      // to release sockets and flow-control credit instead of relying on GC.
+      const consumeJson = expectJson && response.ok && response.status !== 204;
+      try {
+        const payload = consumeJson ? await response.json() as unknown : undefined;
+        return { status: response.status, payload };
+      } finally {
+        if (!consumeJson) {
+          try { await response.body?.cancel(); } catch { /* preserve HTTP status */ }
+        }
+      }
     } finally {
       clearTimeout(timer);
       signal?.removeEventListener('abort', stop);

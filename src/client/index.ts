@@ -247,6 +247,25 @@ export class PeerClient {
     let sessionId: string | undefined;
     let alreadyClosed = false;
     let attemptClosed = false;
+    let established = false;
+    let acknowledged = false;
+    let releaseRequested = false;
+    const releaseSignaling = () => {
+      if (releaseRequested || acknowledged || !sessionId || !this.signaling.cancelOffer) return;
+      releaseRequested = true;
+      const id = sessionId;
+      const cancelController = new AbortController();
+      const cancelTimer = setTimeout(() => cancelController.abort(), 5_000);
+      // Both transport cancellation and the settlement of this best-effort
+      // operation are bounded, even if a custom signaling adapter ignores abort.
+      void underDeadline(
+        () => this.signaling.cancelOffer!(id, cancelController.signal),
+        Date.now() + 5_000, cancelController.signal, 'cancel_offer'
+      ).catch(() => undefined).finally(() => {
+        clearTimeout(cancelTimer);
+        cancelController.abort();
+      });
+    };
     const closeAttempt = () => {
       if (attemptClosed) return;
       attemptClosed = true;
@@ -258,6 +277,9 @@ export class PeerClient {
       alreadyClosed = true;
       controller.abort();
       closeAttempt();
+      // A completed WebRTC session no longer needs its signaling row. If the
+      // receipt ACK was lost, release it when the handle closes.
+      if (established && !acknowledged) releaseSignaling();
     };
     try {
       const ice = replacementIce ?? readPeerIceServers(await underDeadline(
@@ -328,16 +350,9 @@ export class PeerClient {
       await underDeadline(() => connection.setRemoteDescription({ type: 'answer', sdp: answer }), deadline, signal, 'remote_description');
       await waitForChannel(peer, channel, deadline, signal);
       if (signal.aborted) throw new Error('peer_aborted');
-      // Only the browser that successfully received/applied the answer can
-      // acknowledge it. Until this arrives, the signaling store protects
-      // the answer from eviction by another user's connection attempt.
-      if (this.signaling.acknowledgeOffer) {
-        const acknowledgeController = new AbortController();
-        const acknowledgeTimer = setTimeout(() => acknowledgeController.abort(), 5_000);
-        void Promise.resolve()
-          .then(() => this.signaling.acknowledgeOffer!(sessionId!, acknowledgeController.signal))
-          .catch(() => undefined)
-          .finally(() => clearTimeout(acknowledgeTimer));
+      if (channel.readyState !== 'open' ||
+          peer.connectionState === 'closed' || peer.connectionState === 'failed') {
+        throw new Error('peer_channel_failed');
       }
       const handlePeerState = () => {
         if (peer?.connectionState === 'failed' || peer?.connectionState === 'closed') close();
@@ -354,17 +369,47 @@ export class PeerClient {
         }
         close();
       }, { once: true });
+      // Keep the last publication check before starting any asynchronous ACK.
+      if (signal.aborted || channel.readyState !== 'open') throw new Error('peer_channel_failed');
+      established = true;
+      if (this.signaling.acknowledgeOffer) {
+        const id = session.sessionId;
+        const acknowledge = this.signaling.acknowledgeOffer;
+        void (async () => {
+          // Bound retries; an acknowledgement is idempotent and not part of
+          // the service data path. If all attempts fail, cancel the signaling
+          // row rather than occupying another user's capacity until TTL.
+          for (let attempt = 0; attempt < 3 && !signal.aborted; attempt++) {
+            const ackController = new AbortController();
+            const onAbort = () => ackController.abort();
+            signal.addEventListener('abort', onAbort, { once: true });
+            const ackTimer = setTimeout(() => ackController.abort(), 5_000);
+            try {
+              await underDeadline(
+                () => acknowledge(id, ackController.signal),
+                Date.now() + 5_000, ackController.signal, 'acknowledge'
+              );
+              acknowledged = true;
+              return;
+            } catch {
+              // A transient HTTP failure can be retried without making the
+              // established data connection depend on signaling availability.
+            } finally {
+              clearTimeout(ackTimer);
+              signal.removeEventListener('abort', onAbort);
+              ackController.abort();
+            }
+            if (attempt < 2 && !signal.aborted) {
+              await sleep(150 * (attempt + 1), signal).catch(() => undefined);
+            }
+          }
+          releaseSignaling();
+        })().catch(() => releaseSignaling());
+      }
       return result;
     } catch (error) {
       close();
-      if (sessionId && this.signaling.cancelOffer) {
-        const cancelController = new AbortController();
-        const cancelTimer = setTimeout(() => cancelController.abort(), 5_000);
-        void Promise.resolve()
-          .then(() => this.signaling.cancelOffer!(sessionId!, cancelController.signal))
-          .catch(() => undefined)
-          .finally(() => clearTimeout(cancelTimer));
-      }
+      releaseSignaling();
       throw error;
     }
   }
@@ -386,8 +431,13 @@ export function createHttpClientSignaling(options: HttpClientSignalingOptions): 
     if (init.body) headers.set('content-type', 'application/json');
     if (init.signal?.aborted) throw new Error('peer_request_aborted');
     const response = await transport(root + path, { ...init, headers });
-    if (!response.ok) throw new Error('peer_signal_http_' + response.status);
-    if (response.status === 204) return undefined;
+    if (!response.ok || response.status === 204) {
+      // Non-JSON status paths still own a response body: cancel it to release
+      // transport resources, without masking the original HTTP error.
+      try { await response.body?.cancel(); } catch { /* best effort */ }
+      if (!response.ok) throw new Error('peer_signal_http_' + response.status);
+      return undefined;
+    }
     return response.json();
   }
   return {

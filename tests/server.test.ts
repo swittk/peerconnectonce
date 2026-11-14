@@ -55,6 +55,22 @@ describe('bounded HTTP node signaling', () => {
     expect(fetches).toBe(0);
   });
 
+  it('cancels unread response streams on failed claims and non-JSON answers', async () => {
+    let cancelled = 0;
+    const signaling = createHttpNodeSignaling({
+      baseUrl: 'https://broker.example/peer',
+      nodeId: 'node-a',
+      headers: () => ({}),
+      fetch: async (url) => new Response(new ReadableStream({
+        cancel() { cancelled++; },
+      }), { status: String(url).includes('/claim') ? 503 : 200 }),
+    });
+    await expect(signaling.claim()).rejects.toThrow('peer_claim_http_503');
+    expect(cancelled).toBe(1);
+    await expect(signaling.answer('id', 'sdp')).rejects.toThrow('peer_answer_http_200');
+    expect(cancelled).toBe(2);
+  });
+
   it('times out asynchronous credential headers before calling fetch', async () => {
     let fetches = 0;
     const node = createHttpNodeSignaling({

@@ -130,6 +130,95 @@ describe('real Werift server lifecycle', () => {
     }
   });
 
+  it('enforces maxPeers across concurrent direct accepts and outbound polling', async () => {
+    const browser = new RTCPeerConnection({ iceServers: [], iceUseDefaultStunServer: false });
+    browser.createDataChannel('echo-v1', { ordered: true });
+    await browser.setLocalDescription(await browser.createOffer());
+    const sdp = browser.localDescription?.sdp;
+    if (!sdp) throw new Error('test_offer_missing');
+    const lifetime = new AbortController();
+    let claims = 0;
+    const server = new PeerServer({
+      maxPeers: 1, pollIntervalMs: 5, iceServers: [],
+      services: [{ label: 'echo-v1', create: () => ({ receiveMessage() {}, close() {} }) }],
+      signaling: {
+        claim: async () => { claims++; return undefined; },
+        answer: async () => undefined,
+        fail: async () => undefined,
+      },
+    });
+    const makeOffer = (sessionId: string) => ({
+      sessionId, nodeId: 'node-a', ownerUserId: 'user-a',
+      protocol: 'echo-v1', offerSdp: sdp,
+    });
+    try {
+      const firstPending = server.accept(makeOffer('first'), lifetime.signal);
+      await expect(server.accept(makeOffer('second'), lifetime.signal)).rejects.toThrow('peer_capacity');
+      const first = await firstPending;
+      await expect(server.accept(makeOffer('first'), lifetime.signal)).rejects.toThrow('peer_capacity');
+      await expect(server.accept(makeOffer('second'), lifetime.signal)).rejects.toThrow('peer_capacity');
+      const polling = server.start(lifetime.signal);
+      try {
+        await new Promise((resolve) => setTimeout(resolve, 35));
+        expect(claims).toBe(0);
+        await first.close();
+        await new Promise((resolve) => setTimeout(resolve, 35));
+        expect(claims).toBeGreaterThan(0);
+      } finally {
+        lifetime.abort();
+        await polling;
+      }
+      const secondLifetime = new AbortController();
+      const second = await server.accept(makeOffer('second'), secondLifetime.signal);
+      await second.close();
+    } finally {
+      lifetime.abort();
+      await browser.close();
+    }
+  });
+
+  it('isolates a throwing activity probe instead of crashing the timer or other peers', async () => {
+    const browser = new RTCPeerConnection({ iceServers: [], iceUseDefaultStunServer: false });
+    const channel = browser.createDataChannel('echo-v1', { ordered: true });
+    await browser.setLocalDescription(await browser.createOffer());
+    const sdp = browser.localDescription?.sdp;
+    if (!sdp) throw new Error('test_offer_missing');
+    let probes = 0;
+    let serviceClosed = 0;
+    const stop = new AbortController();
+    const server = new PeerServer({
+      iceServers: [], idleTimeoutMs: 30,
+      services: [{ label: 'echo-v1', create: () => ({
+        receiveMessage() {},
+        hasActiveWork() { probes++; throw new Error('adapter_activity_failed'); },
+        close() { serviceClosed++; },
+      }) }],
+      signaling: {
+        claim: async () => undefined,
+        answer: async (_id, answerSdp) => {
+          await browser.setRemoteDescription({ type: 'answer', sdp: answerSdp });
+        },
+        fail: async () => undefined,
+      },
+    });
+    try {
+      const peer = await server.accept({
+        sessionId: 'activity', nodeId: 'node-a', ownerUserId: 'user-a',
+        protocol: 'echo-v1', offerSdp: sdp,
+      }, stop.signal);
+      await Promise.race([
+        peer.finished,
+        new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error('activity_probe_did_not_close')), 5_000)),
+      ]);
+      expect(channel.readyState).toBe('closed');
+      expect(probes).toBeGreaterThan(0);
+      expect(serviceClosed).toBe(1);
+    } finally {
+      stop.abort();
+      await browser.close();
+    }
+  });
+
   it('aborts a pending answer publish if this peer is closed during setup', async () => {
     const browser = new RTCPeerConnection({
       iceServers: [],

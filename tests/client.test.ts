@@ -182,6 +182,97 @@ describe('shared browser WebRTC connection lifecycle', () => {
     // operation, so this checks both cancellation and rejection ownership.
   });
 
+  it('rejects a channel that opens and closes in the same callback without acknowledging', async () => {
+    let ackCount = 0;
+    let cancelCount = 0;
+    class BlinkChannel extends FakeChannel {
+      open() {
+        super.open();
+        super.close();
+      }
+    }
+    class BlinkPeer extends FakePeer {
+      createDataChannel(label: string) {
+        this.channel = new BlinkChannel(label);
+        return this.channel;
+      }
+      async setRemoteDescription(_: RTCSessionDescriptionInit) {
+        this.connectionState = 'connected';
+        setTimeout(() => this.channel?.open(), 0);
+      }
+    }
+    const client = new PeerClient({
+      signaling: {
+        getIceServers: async () => [],
+        createOffer: async () => ({ sessionId: 'blink', iceServers: [] }),
+        readAnswer: async () => ({ status: 'answered', answerSdp: 'answer' }),
+        acknowledgeOffer: async () => { ackCount++; },
+        cancelOffer: async () => { cancelCount++; },
+      },
+      createPeerConnection: () => new BlinkPeer() as unknown as ClientPeerConnection,
+    });
+    await expect(client.connect('echo-v1')).rejects.toThrow('peer_channel_failed');
+    await Promise.resolve();
+    expect(ackCount).toBe(0);
+    expect(cancelCount).toBe(1);
+    client.close();
+  });
+
+  it('retries failed acknowledgements and releases signaling capacity on persistent failure', async () => {
+    const client = new PeerClient({
+      signaling: {
+        getIceServers: async () => [],
+        createOffer: async () => ({ sessionId: 'ack-failure', iceServers: [] }),
+        readAnswer: async () => ({ status: 'answered', answerSdp: 'answer' }),
+        acknowledgeOffer: async () => { throw new Error('temporary_ack_failure'); },
+        cancelOffer: async () => { released?.(); },
+      },
+      createPeerConnection: () => new FakePeer() as unknown as ClientPeerConnection,
+    });
+    let released: (() => void) | undefined;
+    const releasedPromise = new Promise<void>((resolve) => { released = resolve; });
+    const connected = await client.connect('echo-v1');
+    expect(connected.channel.readyState).toBe('open');
+    await Promise.race([
+      releasedPromise,
+      new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error('ack_release_timeout')), 2_500)),
+    ]);
+    expect(connected.channel.readyState).toBe('open');
+    client.close();
+  });
+
+  it('retries an acknowledgement after transient rejection and avoids cancellation', async () => {
+    let attempts = 0;
+    let cancelled = 0;
+    let acknowledged: (() => void) | undefined;
+    const acked = new Promise<void>((resolve) => { acknowledged = resolve; });
+    const client = new PeerClient({
+      signaling: {
+        getIceServers: async () => [],
+        createOffer: async () => ({ sessionId: 'ack-recovered', iceServers: [] }),
+        readAnswer: async () => ({ status: 'answered', answerSdp: 'answer' }),
+        acknowledgeOffer: async () => {
+          attempts++;
+          if (attempts < 3) throw new Error('transient_error');
+          acknowledged?.();
+        },
+        cancelOffer: async () => { cancelled++; },
+      },
+      createPeerConnection: () => new FakePeer() as unknown as ClientPeerConnection,
+    });
+    const connected = await client.connect('echo-v1');
+    await acked;
+    // The callback signals before the promise completion updates the client's
+    // acknowledged flag; wait for that normal completion, not merely the call.
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(attempts).toBe(3);
+    expect(cancelled).toBe(0);
+    client.close();
+    await Promise.resolve();
+    expect(cancelled).toBe(0);
+    expect(connected.channel.readyState).toBe('closed');
+  });
+
   it('rejects different service on one live client and cannot silently reuse an old channel', async () => {
     const client = new PeerClient({
       signaling: {
@@ -255,6 +346,19 @@ describe('shared browser WebRTC connection lifecycle', () => {
     expect(rtcConfigs[0]!.iceServers).toEqual([]);
     expect(rtcConfigs[1]!.iceServers).toEqual([{ urls: 'turn:node.example:3478' }]);
     client.close();
+  });
+
+  it('cancels unread HTTP error bodies without masking the response status', async () => {
+    let cancelled = 0;
+    const signaling = createHttpClientSignaling({
+      baseUrl: 'https://broker.example/peer',
+      headers: () => ({}),
+      fetch: async () => new Response(new ReadableStream({
+        cancel() { cancelled++; },
+      }), { status: 503 }),
+    });
+    await expect(signaling.readAnswer('session')).rejects.toThrow('peer_signal_http_503');
+    expect(cancelled).toBe(1);
   });
 
   it('rejects malformed HTTP answer states without polling indefinitely', async () => {
