@@ -120,6 +120,68 @@ describe('shared browser WebRTC connection lifecycle', () => {
     client.close();
   });
 
+  it('does not publish or acknowledge a connection aborted immediately after its channel opens', async () => {
+    let client: PeerClient;
+    let acknowledged = 0;
+    let cancelled = 0;
+    let offered: FakeChannel | undefined;
+    class RaceChannel extends FakeChannel {
+      open() {
+        super.open();
+        // The open event has already satisfied the pending wait. Shutdown
+        // synchronously before the await continuation can publish the handle.
+        client.close();
+      }
+    }
+    class RacePeer extends FakePeer {
+      createDataChannel(label: string) {
+        offered = new RaceChannel(label);
+        this.channel = offered;
+        return offered;
+      }
+      async setRemoteDescription(_description: RTCSessionDescriptionInit) {
+        this.connectionState = 'connected';
+        setTimeout(() => this.channel?.open(), 0);
+      }
+    }
+    client = new PeerClient({
+      signaling: {
+        getIceServers: async () => [],
+        createOffer: async () => ({ sessionId: 'aborted-after-open', iceServers: [] }),
+        readAnswer: async () => ({ status: 'answered', answerSdp: 'answer' }),
+        acknowledgeOffer: async () => { acknowledged++; },
+        cancelOffer: async () => { cancelled++; },
+      },
+      createPeerConnection: () => new RacePeer() as unknown as ClientPeerConnection,
+    });
+    await expect(client.connect('echo-v1')).rejects.toThrow('peer_aborted');
+    await Promise.resolve();
+    expect(acknowledged).toBe(0);
+    expect(offered?.readyState).toBe('closed');
+    expect(cancelled).toBe(1);
+  });
+
+  it('observes a rejected injected operation that aborts during invocation', async () => {
+    let client: PeerClient;
+    class AbortingPeer extends FakePeer {
+      async setLocalDescription(_description: RTCSessionDescriptionInit) {
+        client.close();
+        throw new Error('injected_local_rejection');
+      }
+    }
+    client = new PeerClient({
+      signaling: {
+        getIceServers: async () => [],
+        createOffer: async () => ({ sessionId: 'unused', iceServers: [] }),
+        readAnswer: async () => ({ status: 'pending' }),
+      },
+      createPeerConnection: () => new AbortingPeer() as unknown as ClientPeerConnection,
+    });
+    await expect(client.connect('echo-v1')).rejects.toThrow('peer_aborted');
+    // Vitest also fails the suite on an unhandled rejection from the injected
+    // operation, so this checks both cancellation and rejection ownership.
+  });
+
   it('rejects different service on one live client and cannot silently reuse an old channel', async () => {
     const client = new PeerClient({
       signaling: {
@@ -250,6 +312,51 @@ describe('shared browser WebRTC connection lifecycle', () => {
     await expect(client.connect('echo-v1')).rejects.toThrow('invalid_peer_answer');
     expect(reads).toBe(1);
     client.close();
+  });
+
+  it('cancels stalled client credential generation without issuing a request', async () => {
+    const controller = new AbortController();
+    let fetched = 0;
+    let started: (() => void) | undefined;
+    const headersStarted = new Promise<void>((resolve) => { started = resolve; });
+    let release: (() => void) | undefined;
+    const headers = new Promise<Record<string, string>>((resolve) => {
+      release = () => resolve({ authorization: 'Bearer stale' });
+    });
+    const signaling = createHttpClientSignaling({
+      baseUrl: 'https://broker.example/peer',
+      headers: () => { started?.(); return headers; },
+      fetch: async () => {
+        fetched++;
+        return new Response('{}');
+      },
+    });
+    const pending = signaling.getIceServers({ protocol: 'echo-v1', signal: controller.signal });
+    await headersStarted;
+    controller.abort();
+    await expect(pending).rejects.toThrow('peer_request_aborted');
+    release?.();
+    await Promise.resolve();
+    expect(fetched).toBe(0);
+  });
+
+  it('fences the client HTTP dispatch if headers resolve just before shutdown', async () => {
+    const controller = new AbortController();
+    let fetched = 0;
+    const signaling = createHttpClientSignaling({
+      baseUrl: 'https://broker.example/peer',
+      headers: () => {
+        queueMicrotask(() => queueMicrotask(() => controller.abort()));
+        return {};
+      },
+      fetch: async () => {
+        fetched++;
+        return new Response('{}');
+      },
+    });
+    await expect(signaling.getIceServers({ protocol: 'echo-v1', signal: controller.signal }))
+      .rejects.toThrow('peer_request_aborted');
+    expect(fetched).toBe(0);
   });
 
   it('accepts old signaling 404/501 ICE preflight without bypassing offer authorization', async () => {

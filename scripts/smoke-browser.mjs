@@ -38,7 +38,8 @@ const server = createServer(async (request, response) => {
       response.end('<!doctype html><title>PeerConnectOnce browser smoke</title>');
       return;
     }
-    if (pathname === '/dist/browser/index.js' || pathname === '/dist/client/index.js' || pathname === '/dist/shared/contracts.js') {
+    if (pathname === '/dist/browser/index.js' || pathname === '/dist/client/index.js' ||
+        pathname === '/dist/shared/contracts.js' || pathname === '/dist/shared/http.js') {
       const path = resolve(root, pathname.slice(1));
       response.setHeader('content-type', 'text/javascript');
       response.end(await readFile(path));

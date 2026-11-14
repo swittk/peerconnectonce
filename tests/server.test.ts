@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { BoundedPeerWriter, PeerServiceRegistry, createHttpNodeSignaling } from '../src/server/index.js';
+import { BoundedPeerWriter, PeerServiceRegistry, PeerServer, createHttpNodeSignaling } from '../src/server/index.js';
 
 function channel() {
   let sendCount = 0;
@@ -171,7 +171,66 @@ describe('generic peer service registry', () => {
   });
 });
 
+describe('bounded resource configuration', () => {
+  const base = {
+    signaling: { claim: async () => undefined, answer: async () => undefined, fail: async () => undefined },
+    services: [{ label: 'echo-v1', create: () => ({ receiveMessage() {}, close() {} }) }],
+    iceServers: [],
+  };
+  it('rejects non-finite, fractional and invalid peer limits before starting', () => {
+    for (const invalid of [
+      { maxPeers: NaN }, { maxPeers: Infinity }, { maxPeers: 0 },
+      { pollIntervalMs: NaN }, { setupTimeoutMs: Infinity }, { idleTimeoutMs: 0.5 },
+      { bufferedHighBytes: NaN }, { bufferedLowBytes: NaN },
+      { maxQueuedBytes: Infinity }, { maxQueuedMessages: NaN }, { maxMessageBytes: NaN },
+    ]) {
+      expect(() => new PeerServer({ ...base, ...invalid })).toThrow(/invalid_peer/);
+    }
+  });
+  it('rejects invalid writer capacity instead of silently disabling backpressure', () => {
+    for (const invalid of [
+      { highBytes: NaN }, { highBytes: Infinity }, { highBytes: 1.5 },
+      { lowBytes: NaN }, { lowBytes: -1 },
+      { maxQueuedBytes: NaN }, { maxQueuedBytes: 0 },
+      { maxMessageBytes: NaN }, { maxMessageBytes: 0.5 },
+      { maxQueuedMessages: Infinity }, { outgoingBytesPerSecond: NaN },
+    ]) {
+      expect(() => new BoundedPeerWriter(channel() as never, invalid)).toThrow('invalid_peer_writer_limits');
+    }
+  });
+});
+
 describe('bounded writer, no artificial default throttle', () => {
+  it('starts closed when supplied a previously-aborted signal', async () => {
+    const signal = new AbortController();
+    signal.abort();
+    const fake = channel();
+    const writer = new BoundedPeerWriter(fake as never, { signal: signal.signal });
+    await expect(writer.sendText('hello')).rejects.toThrow('peer_channel_closed');
+    expect(fake.sendCount).toBe(0);
+  });
+
+  it('does not retain large backing buffers or allow source mutation while queued', async () => {
+    const fake = channel();
+    fake.bufferedAmount = 200;
+    const writer = new BoundedPeerWriter(fake as never, {
+      highBytes: 100, lowBytes: 20, maxMessageBytes: 2048,
+    });
+    const backing = new Uint8Array(16 * 1024 * 1024);
+    backing[10] = 87;
+    const view = backing.subarray(10, 1034);
+    const pending = writer.sendBinary(view);
+    await fake.whenWaiting();
+    backing[10] = 12;
+    fake.bufferedAmount = 0;
+    fake.emitLow();
+    await pending;
+    const sent = fake.sent[0] as Buffer;
+    expect(sent[0]).toBe(87);
+    expect(sent.length).toBe(1024);
+    expect(sent.buffer.byteLength).toBeLessThan(1024 * 1024);
+    writer.close();
+  });
   it('can send many frames without per-frame timer work', async () => {
     const fake = channel();
     const writer = new BoundedPeerWriter(fake as never, { maxQueuedBytes: 24 * 1024 * 1024 });

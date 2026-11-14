@@ -3,6 +3,7 @@ import {
   type PeerClientSignaling, type PeerSessionCreation, type PeerSessionStatus, type PeerIceServer,
   type PeerHttpHeaders,
 } from '../shared/contracts.js';
+import { resolvePeerHeaders } from '../shared/http.js';
 
 export type { PeerClientSignaling, PeerSessionCreation, PeerSessionStatus } from '../shared/contracts.js';
 
@@ -55,7 +56,7 @@ function validMilliseconds(value: number): number {
 
 /** A deadline shared by all non-trickle SDP operations, with real abort cleanup. */
 function underDeadline<T>(
-  promise: Promise<T>,
+  run: () => Promise<T>,
   deadline: number,
   signal: AbortSignal,
   operation: string,
@@ -79,7 +80,12 @@ function underDeadline<T>(
     const onAbort = () => finish(new Error('peer_aborted'));
     signal.addEventListener('abort', onAbort, { once: true });
     timer = setTimeout(() => finish(new Error('peer_timeout:' + operation)), remaining);
-    promise.then((result) => finish(undefined, result), (reason: unknown) =>
+    // The call starts only after its deadline/abort guards, and every
+    // rejection is observed even if the injected operation aborts synchronously.
+    Promise.resolve().then(() => {
+      if (signal.aborted) throw new Error('peer_aborted');
+      return run();
+    }).then((result) => finish(undefined, result), (reason: unknown) =>
       finish(reason instanceof Error ? reason : new Error('peer_' + operation + '_failed')));
   });
 }
@@ -89,7 +95,7 @@ async function gatherIce(connection: ClientPeerConnection, deadline: number, sig
   if (connection.iceGatheringState === 'complete') return;
   let unsubscribe: (() => void) | undefined;
   try {
-    await underDeadline(new Promise<void>((resolve) => {
+    await underDeadline(() => new Promise<void>((resolve) => {
       const listener = () => {
         if (connection.iceGatheringState === 'complete') resolve();
       };
@@ -107,7 +113,7 @@ async function waitForChannel(connection: ClientPeerConnection, channel: ClientP
   if (channel.readyState === 'open') return;
   let unsubscribe: (() => void) | undefined;
   try {
-    await underDeadline(new Promise<void>((resolve, reject) => {
+    await underDeadline(() => new Promise<void>((resolve, reject) => {
       const onOpen = () => resolve();
       const onClosed = () => reject(new Error('peer_channel_failed'));
       const onConnection = () => {
@@ -255,18 +261,19 @@ export class PeerClient {
     };
     try {
       const ice = replacementIce ?? readPeerIceServers(await underDeadline(
-        this.signaling.getIceServers({ protocol, nodeId, signal }), deadline, signal, 'ice_config'
+        () => this.signaling.getIceServers({ protocol, nodeId, signal }), deadline, signal, 'ice_config'
       ));
-      peer = this.makeConnection({ iceServers: ice });
-      channel = peer.createDataChannel(protocol, { ordered: true });
+      const connection = this.makeConnection({ iceServers: ice });
+      peer = connection;
+      channel = connection.createDataChannel(protocol, { ordered: true });
       channel.binaryType = 'arraybuffer';
-      const offer = await underDeadline(peer.createOffer(), deadline, signal, 'create_offer');
-      await underDeadline(peer.setLocalDescription(offer), deadline, signal, 'local_description');
+      const offer = await underDeadline(() => connection.createOffer(), deadline, signal, 'create_offer');
+      await underDeadline(() => connection.setLocalDescription(offer), deadline, signal, 'local_description');
       await gatherIce(peer, Math.min(deadline, Date.now() + this.iceGatheringTimeoutMs), signal);
       const offerSdp = peer.localDescription?.sdp;
       if (!offerSdp) throw new Error('peer_missing_local_sdp');
       const session = await underDeadline(
-        this.signaling.createOffer({ protocol, offerSdp, ...(nodeId ? { nodeId } : {}), signal }),
+        () => this.signaling.createOffer({ protocol, offerSdp, ...(nodeId ? { nodeId } : {}), signal }),
         deadline, signal, 'signal_offer'
       );
       sessionId = session.sessionId;
@@ -286,7 +293,7 @@ export class PeerClient {
           signal.addEventListener('abort', cancelForParent, { once: true });
           try {
             await underDeadline(
-              this.signaling.cancelOffer(supersededSessionId, cancelController.signal),
+              () => this.signaling.cancelOffer!(supersededSessionId, cancelController.signal),
               deadline, signal, 'late_ice_cancel'
             );
           } catch (error) {
@@ -305,7 +312,7 @@ export class PeerClient {
       }
       let answer: string | undefined;
       while (!answer) {
-        const state = await underDeadline(this.signaling.readAnswer(sessionId, signal), deadline, signal, 'signal_answer');
+        const state = await underDeadline(() => this.signaling.readAnswer(session.sessionId, signal), deadline, signal, 'signal_answer');
         if (state.status === 'failed') throw new Error('peer_offer_rejected');
         if (state.status === 'answered') {
           if (typeof state.answerSdp !== 'string' || !state.answerSdp) {
@@ -313,13 +320,14 @@ export class PeerClient {
           }
           answer = state.answerSdp;
         } else if (state.status === 'pending') {
-          await underDeadline(sleep(this.answerPollIntervalMs, signal), deadline, signal, 'answer_poll');
+          await underDeadline(() => sleep(this.answerPollIntervalMs, signal), deadline, signal, 'answer_poll');
         } else {
           throw new Error('invalid_peer_answer');
         }
       }
-      await underDeadline(peer.setRemoteDescription({ type: 'answer', sdp: answer }), deadline, signal, 'remote_description');
+      await underDeadline(() => connection.setRemoteDescription({ type: 'answer', sdp: answer }), deadline, signal, 'remote_description');
       await waitForChannel(peer, channel, deadline, signal);
+      if (signal.aborted) throw new Error('peer_aborted');
       // Only the browser that successfully received/applied the answer can
       // acknowledge it. Until this arrives, the signaling store protects
       // the answer from eviction by another user's connection attempt.
@@ -374,8 +382,9 @@ export function createHttpClientSignaling(options: HttpClientSignalingOptions): 
   const root = options.baseUrl.replace(/\/$/, '');
   const transport = options.fetch ?? fetch;
   async function request(path: string, init: RequestInit = {}): Promise<unknown> {
-    const headers = new Headers(await options.headers());
+    const headers = await resolvePeerHeaders(options.headers, init.signal);
     if (init.body) headers.set('content-type', 'application/json');
+    if (init.signal?.aborted) throw new Error('peer_request_aborted');
     const response = await transport(root + path, { ...init, headers });
     if (!response.ok) throw new Error('peer_signal_http_' + response.status);
     if (response.status === 204) return undefined;

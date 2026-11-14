@@ -92,6 +92,44 @@ describe('real Werift server lifecycle', () => {
     }
   });
 
+  it('observes a rejected signaling promise when the operation aborts shutdown', async () => {
+    const browser = new RTCPeerConnection({ iceServers: [], iceUseDefaultStunServer: false });
+    browser.createDataChannel('echo-v1', { ordered: true });
+    await browser.setLocalDescription(await browser.createOffer());
+    const sdp = browser.localDescription?.sdp;
+    if (!sdp) throw new Error('missing_test_offer');
+    const shutdown = new AbortController();
+    let published = 0;
+    const server = new PeerServer({
+      iceServers: [], setupTimeoutMs: 3_000,
+      services: [{ label: 'echo-v1', create: () => ({ receiveMessage() {}, close() {} }) }],
+      signaling: {
+        claim: async () => undefined,
+        answer: () => {
+          published++;
+          shutdown.abort();
+          // The original eager beforeDeadline could reject on the abort and
+          // leave this separate injected promise rejection unobserved.
+          return Promise.reject(new Error('injected_answer_rejected'));
+        },
+        fail: async () => undefined,
+      },
+    });
+    try {
+      await expect(server.accept({
+        sessionId: 'abort-answer', nodeId: 'node-a',
+        ownerUserId: 'user-a', protocol: 'echo-v1', offerSdp: sdp,
+      }, shutdown.signal)).rejects.toThrow('peer_stopped');
+      expect(published).toBe(1);
+      // The test runner also fails if injected_answer_rejected leaks as
+      // an unhandled rejection on the next microtask.
+      await Promise.resolve();
+    } finally {
+      shutdown.abort();
+      await browser.close();
+    }
+  });
+
   it('aborts a pending answer publish if this peer is closed during setup', async () => {
     const browser = new RTCPeerConnection({
       iceServers: [],

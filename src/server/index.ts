@@ -3,6 +3,7 @@ import type { PeerIceServer, PeerHttpHeaders } from '../shared/contracts.js';
 import {
   isPeerLabel, type PeerNodeSignaling, type PeerOffer,
 } from '../shared/contracts.js';
+import { resolvePeerHeaders } from '../shared/http.js';
 
 export type { PeerNodeSignaling, PeerOffer } from '../shared/contracts.js';
 
@@ -134,11 +135,15 @@ export class BoundedPeerWriter implements PeerChannelWriter {
     this.maxQueuedMessages = options.maxQueuedMessages ?? 1024;
     this.maxFrame = options.maxMessageBytes ?? 64 * 1024;
     this.rate = options.outgoingBytesPerSecond ?? 0;
-    if (this.high <= this.low || this.low < 0 || this.maxQueued <= 0 || this.maxFrame <= 0 ||
+    if (!Number.isSafeInteger(this.high) || this.high <= 0 ||
+        !Number.isSafeInteger(this.low) || this.low < 0 || this.high <= this.low ||
+        !Number.isSafeInteger(this.maxQueued) || this.maxQueued <= 0 ||
+        !Number.isSafeInteger(this.maxFrame) || this.maxFrame <= 0 ||
         !Number.isSafeInteger(this.maxQueuedMessages) || this.maxQueuedMessages < 1 ||
         !Number.isFinite(this.rate) || this.rate < 0) throw new Error('invalid_peer_writer_limits');
     channel.bufferedAmountLowThreshold = this.low;
     options.signal?.addEventListener('abort', () => this.close(), { once: true });
+    if (options.signal?.aborted) this.close();
   }
 
   sendText(message: string): Promise<void> {
@@ -146,15 +151,19 @@ export class BoundedPeerWriter implements PeerChannelWriter {
   }
 
   sendBinary(message: Uint8Array): Promise<void> {
-    return this.enqueue(Buffer.from(message.buffer, message.byteOffset, message.byteLength), message.byteLength);
+    return this.enqueue(message, message.byteLength);
   }
 
-  private enqueue(message: string | Buffer, size: number): Promise<void> {
+  private enqueue(message: string | Uint8Array, size: number): Promise<void> {
     if (this.closed || this.channel.readyState !== 'open') return Promise.reject(new Error('peer_channel_closed'));
-    if (size > this.maxFrame || this.queuedBytes + size > this.maxQueued ||
+    if (size > this.maxFrame || size > this.maxQueued - this.queuedBytes ||
         this.queuedMessages >= this.maxQueuedMessages) {
       return Promise.reject(new Error('peer_writer_capacity'));
     }
+    // Copy exactly the admitted visible bytes, and ONLY after admission. A
+    // 1 KiB slice cannot retain its 64 MiB backing array while queued, nor
+    // can a rejected oversized payload cause an unnecessary allocation.
+    const payload = typeof message === 'string' ? message : Buffer.from(message);
     this.queuedBytes += size;
     this.queuedMessages++;
     const send = this.tail.then(async () => {
@@ -162,7 +171,7 @@ export class BoundedPeerWriter implements PeerChannelWriter {
       await this.waitForBuffer();
       if (this.rate > 0) await this.waitForOptionalRate(size);
       if (this.closed || this.channel.readyState !== 'open') throw new Error('peer_channel_closed');
-      this.channel.send(message);
+      this.channel.send(payload);
     }).finally(() => {
       this.queuedBytes -= size;
       this.queuedMessages--;
@@ -235,7 +244,7 @@ function delay(ms: number, signal: AbortSignal): Promise<void> {
   });
 }
 
-function beforeDeadline<T>(promise: Promise<T>, deadline: number, signal: AbortSignal): Promise<T> {
+function beforeDeadline<T>(run: () => Promise<T>, deadline: number, signal: AbortSignal): Promise<T> {
   if (signal.aborted) return Promise.reject(new Error('peer_stopped'));
   const remaining = deadline - Date.now();
   if (remaining <= 0) return Promise.reject(new Error('peer_setup_timeout'));
@@ -252,7 +261,10 @@ function beforeDeadline<T>(promise: Promise<T>, deadline: number, signal: AbortS
     const abort = () => finish(new Error('peer_stopped'));
     signal.addEventListener('abort', abort, { once: true });
     timer = setTimeout(() => finish(new Error('peer_setup_timeout')), remaining);
-    promise.then((result) => finish(undefined, result), (reason: unknown) =>
+    Promise.resolve().then(() => {
+      if (signal.aborted) throw new Error('peer_stopped');
+      return run();
+    }).then((result) => finish(undefined, result), (reason: unknown) =>
       finish(reason instanceof Error ? reason : new Error('peer_setup_failed')));
   });
 }
@@ -276,9 +288,28 @@ export class PeerServer {
       setupTimeoutMs: options.setupTimeoutMs ?? 45_000,
       idleTimeoutMs: options.idleTimeoutMs ?? 15 * 60_000,
     };
-    if (this.options.maxPeers < 1 || this.options.pollIntervalMs < 1 ||
-        this.options.idleTimeoutMs < 1 || this.options.setupTimeoutMs < 1)
+    if (!Number.isSafeInteger(this.options.maxPeers) || this.options.maxPeers < 1 ||
+        !Number.isSafeInteger(this.options.pollIntervalMs) || this.options.pollIntervalMs < 1 ||
+        !Number.isSafeInteger(this.options.idleTimeoutMs) || this.options.idleTimeoutMs < 1 ||
+        !Number.isSafeInteger(this.options.setupTimeoutMs) || this.options.setupTimeoutMs < 1 ||
+        this.options.pollIntervalMs > 2_147_483_647 ||
+        this.options.idleTimeoutMs > 2_147_483_647 ||
+        this.options.setupTimeoutMs > 2_147_483_647)
       throw new Error('invalid_peer_server_limits');
+    // Fail fast on invalid writer bounds before accepting an incoming peer.
+    const high = options.bufferedHighBytes ?? 4 * 1024 * 1024;
+    const low = options.bufferedLowBytes ?? 1024 * 1024;
+    const queued = options.maxQueuedBytes ?? 8 * 1024 * 1024;
+    const messages = options.maxQueuedMessages ?? 1024;
+    const frame = options.maxMessageBytes ?? 64 * 1024;
+    if (!Number.isSafeInteger(high) || high <= 0 ||
+        !Number.isSafeInteger(low) || low < 0 || low >= high ||
+        !Number.isSafeInteger(queued) || queued <= 0 ||
+        !Number.isSafeInteger(messages) || messages < 1 ||
+        !Number.isSafeInteger(frame) || frame <= 0 ||
+        !Number.isFinite(options.outgoingBytesPerSecond ?? 0) ||
+        (options.outgoingBytesPerSecond ?? 0) < 0)
+      throw new Error('invalid_peer_writer_limits');
   }
 
   /** Outbound-only node polling. The host controls credentials and the signaling endpoint. */
@@ -442,12 +473,12 @@ export class PeerServer {
 
     try {
       const deadline = Date.now() + this.options.setupTimeoutMs;
-      await beforeDeadline(connection.setRemoteDescription({ type: 'offer', sdp: offer.offerSdp }), deadline, controller.signal);
-      const answer = await beforeDeadline(connection.createAnswer(), deadline, controller.signal);
-      await beforeDeadline(connection.setLocalDescription(answer), deadline, controller.signal);
+      await beforeDeadline(() => connection.setRemoteDescription({ type: 'offer', sdp: offer.offerSdp }), deadline, controller.signal);
+      const answer = await beforeDeadline(() => connection.createAnswer(), deadline, controller.signal);
+      await beforeDeadline(() => connection.setLocalDescription(answer), deadline, controller.signal);
       const sdp = connection.localDescription?.sdp;
       if (!sdp) throw new Error('peer_answer_missing');
-      await beforeDeadline(this.options.signaling.answer(offer.sessionId, sdp, controller.signal), deadline, controller.signal);
+      await beforeDeadline(() => this.options.signaling.answer(offer.sessionId, sdp, controller.signal), deadline, controller.signal);
     } catch (error) {
       await close();
       if (!shutdownSignal.aborted) await this.options.signaling.fail(offer.sessionId, shutdownSignal).catch(() => undefined);
@@ -496,35 +527,7 @@ export function createHttpNodeSignaling(options: HttpNodeSignalingOptions): Peer
     if (signal?.aborted) controller.abort();
     const timer = setTimeout(stop, options.requestTimeoutMs ?? 15_000);
     try {
-      // Credential refresh may be async and may ignore AbortSignal. Race it
-      // against the existing request controller so shutdown/timeout settles
-      // promptly and cannot proceed to fetch with stale credentials.
-      const headerValues = await new Promise<PeerHttpHeaders>((resolve, reject) => {
-        if (controller.signal.aborted) {
-          reject(new Error('peer_request_aborted'));
-          return;
-        }
-        const onAbort = () => {
-          controller.signal.removeEventListener('abort', onAbort);
-          reject(new Error('peer_request_aborted'));
-        };
-        controller.signal.addEventListener('abort', onAbort, { once: true });
-        Promise.resolve().then(() => {
-          if (controller.signal.aborted) throw new Error('peer_request_aborted');
-          return options.headers();
-        }).then(
-          (value) => {
-            controller.signal.removeEventListener('abort', onAbort);
-            if (controller.signal.aborted) reject(new Error('peer_request_aborted'));
-            else resolve(value);
-          },
-          (error: unknown) => {
-            controller.signal.removeEventListener('abort', onAbort);
-            reject(error);
-          }
-        );
-      });
-      const headers = new Headers(headerValues);
+      const headers = await resolvePeerHeaders(options.headers, controller.signal);
       if (body) headers.set('content-type', 'application/json');
       // A shutdown microtask can fire after credential resolution but before
       // this continuation runs. Do not dispatch an already-aborted request,
