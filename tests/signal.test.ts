@@ -48,6 +48,77 @@ describe('MemoryPeerSessionStore', () => {
     expect(store.answer('node', b, { answerSdp: 'too-late' })).toBe(false);
   });
 
+  it('bounds retained answered/failed sessions per owner without blocking another user', () => {
+    let serial = 0;
+    const store = new MemoryPeerSessionStore({
+      ttlMs: 60_000, retentionMs: 60_000,
+      maxSessions: 4, maxPendingPerUser: 2, maxSessionsPerUser: 2,
+      createId: () => 'terminal-' + ++serial,
+    });
+    const quiet = store.create({ nodeId: 'other', ownerUserId: 'quiet', protocol: 'echo-v1', offerSdp: 'quiet' });
+    let firstNoisy: string | undefined;
+    let lastNoisy = '';
+    for (let i = 0; i < 40; i++) {
+      const id = store.create({ nodeId: 'noisy-node', ownerUserId: 'noisy', protocol: 'echo-v1', offerSdp: String(i) });
+      if (!firstNoisy) firstNoisy = id;
+      lastNoisy = id;
+      expect(store.claim('noisy-node')?.sessionId).toBe(id);
+      const isFailure = i % 2 === 0;
+      expect(store.answer('noisy-node', id,
+        isFailure ? { failed: true } : { answerSdp: 'response-' + i })).toBe(true);
+      expect(store.read(id, 'noisy')).toEqual(isFailure
+        ? { status: 'failed' } : { status: 'answered', answerSdp: 'response-' + i });
+    }
+    expect(store.read(firstNoisy!, 'noisy')).toBeUndefined();
+    expect(store.read(lastNoisy, 'noisy')).toEqual({ status: 'answered', answerSdp: 'response-39' });
+    expect(store.read(quiet, 'quiet')).toEqual({ status: 'pending' });
+    expect(store.claim('other')?.sessionId).toBe(quiet);
+    const thirdUser = store.create({ nodeId: 'third', ownerUserId: 'third', protocol: 'echo-v1', offerSdp: 'third' });
+    expect(store.claim('third')?.sessionId).toBe(thirdUser);
+  });
+
+  it('reclaims the oldest terminal globally at capacity without evicting pending offers', () => {
+    let serial = 0;
+    const store = new MemoryPeerSessionStore({
+      maxSessions: 3, maxPendingPerUser: 2, maxSessionsPerUser: 3,
+      createId: () => 'global-' + ++serial,
+    });
+    const row = (ownerUserId: string) =>
+      ({ nodeId: 'node', ownerUserId, protocol: 'echo-v1', offerSdp: ownerUserId });
+    const pending = store.create(row('pending-owner'));
+    const completed = store.create(row('completed-owner'));
+    expect(store.claim('node')?.sessionId).toBe(pending);
+    expect(store.claim('node')?.sessionId).toBe(completed);
+    expect(store.answer('node', completed, { answerSdp: 'done' })).toBe(true);
+    const failed = store.create(row('failed-owner'));
+    expect(store.claim('node')?.sessionId).toBe(failed);
+    expect(store.answer('node', failed, { failed: true })).toBe(true);
+    const newcomer = store.create(row('newcomer'));
+    expect(store.read(completed, 'completed-owner')).toBeUndefined();
+    expect(store.read(failed, 'failed-owner')).toEqual({ status: 'failed' });
+    expect(store.read(pending, 'pending-owner')).toEqual({ status: 'pending' });
+    expect(store.claim('node')?.sessionId).toBe(newcomer);
+    expect(store.answer('node', completed, { answerSdp: 'late' })).toBe(false);
+  });
+
+  it('rejects capacity overflow when all sessions are pending rather than silently evicting work', () => {
+    let serial = 0;
+    const store = new MemoryPeerSessionStore({
+      maxSessions: 2, maxPendingPerUser: 2, maxSessionsPerUser: 2,
+      createId: () => 'pending-' + ++serial,
+    });
+    const input = { nodeId: 'node', ownerUserId: 'alice', protocol: 'echo-v1', offerSdp: 'x' };
+    const a = store.create(input);
+    const b = store.create(input);
+    expect(() => store.create({ ...input, ownerUserId: 'bob' })).toThrow('peer_capacity');
+    expect(store.claim('node')?.sessionId).toBe(a);
+    expect(store.claim('node')?.sessionId).toBe(b);
+    expect(store.claim('node')).toBeUndefined();
+    store.cancel(a, 'alice');
+    const c = store.create({ ...input, ownerUserId: 'bob' });
+    expect(store.claim('node')?.sessionId).toBe(c);
+  });
+
   it('allows repeated cancellation without exhausting global retained-session capacity', () => {
     let counter = 0;
     const store = new MemoryPeerSessionStore({

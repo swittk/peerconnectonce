@@ -19,6 +19,8 @@ export type MemoryPeerSessionStoreOptions = {
   retentionMs?: number;
   maxSessions?: number;
   maxPendingPerUser?: number;
+  /** Bounds pending + retained terminal sessions owned by one user. */
+  maxSessionsPerUser?: number;
   now?: () => number;
   createId?: () => string;
 };
@@ -29,10 +31,18 @@ type StoredSession = PeerOffer & {
   deleteAt: number;
 };
 
-/** Single-process store; applications requiring HA inject their own store instead. */
+/**
+ * Single-process rendezvous store. Live session lookup, per-user capacity and
+ * node claims use indexed Maps/Sets, not whole-store scans. Terminal rows are
+ * evicted oldest-first only when needed to preserve connection availability.
+ */
 export class MemoryPeerSessionStore implements PeerSessionStore {
   private readonly sessions = new Map<string, StoredSession>();
-  /** Skip full-store expiry sweeps until an actual session deadline is due. */
+  private readonly ownerSessions = new Map<string, Set<string>>();
+  private readonly terminalByOwner = new Map<string, Set<string>>();
+  private readonly terminalSessions = new Set<string>();
+  private readonly claimableByNode = new Map<string, Set<string>>();
+  /** Sweep expiry only when some stored session's deadline has elapsed. */
   private nextSweepAtMs = Infinity;
   private readonly now: () => number;
   private readonly createId: () => string;
@@ -40,6 +50,7 @@ export class MemoryPeerSessionStore implements PeerSessionStore {
   private readonly retentionMs: number;
   private readonly maxSessions: number;
   private readonly maxPendingPerUser: number;
+  private readonly maxSessionsPerUser: number;
 
   constructor(options: MemoryPeerSessionStoreOptions = {}) {
     this.now = options.now ?? Date.now;
@@ -48,20 +59,61 @@ export class MemoryPeerSessionStore implements PeerSessionStore {
     this.retentionMs = positiveInteger(options.retentionMs ?? 300_000);
     this.maxSessions = positiveInteger(options.maxSessions ?? 128);
     this.maxPendingPerUser = positiveInteger(options.maxPendingPerUser ?? 8);
+    this.maxSessionsPerUser = positiveInteger(
+      options.maxSessionsPerUser ?? Math.min(this.maxSessions, this.maxPendingPerUser * 2)
+    );
+  }
+
+  /** Maintain small per-key insertion-ordered indexes in constant time. */
+  private addIndex(index: Map<string, Set<string>>, key: string, id: string): void {
+    let ids = index.get(key);
+    if (!ids) {
+      ids = new Set<string>();
+      index.set(key, ids);
+    }
+    ids.add(id);
+  }
+
+  /** Remove one indexed id, including the empty owner/node bucket. */
+  private removeIndex(index: Map<string, Set<string>>, key: string, id: string): void {
+    const ids = index.get(key);
+    if (!ids) return;
+    ids.delete(id);
+    if (ids.size === 0) index.delete(key);
+  }
+
+  /** Delete one session from all indexes without a scan or retained tombstone. */
+  private removeSession(session: StoredSession): void {
+    this.sessions.delete(session.sessionId);
+    this.removeIndex(this.ownerSessions, session.ownerUserId, session.sessionId);
+    if (session.status.status === 'pending') {
+      if (!session.claimed) this.removeIndex(this.claimableByNode, session.nodeId, session.sessionId);
+    } else {
+      this.removeIndex(this.terminalByOwner, session.ownerUserId, session.sessionId);
+      this.terminalSessions.delete(session.sessionId);
+    }
+  }
+
+  /** Retain the terminal status but remove a pending offer from the node queue. */
+  private finishSession(session: StoredSession, status: PeerSessionStatus): void {
+    if (!session.claimed) this.removeIndex(this.claimableByNode, session.nodeId, session.sessionId);
+    session.status = status;
+    session.offerSdp = '';
+    this.addIndex(this.terminalByOwner, session.ownerUserId, session.sessionId);
+    this.terminalSessions.add(session.sessionId);
   }
 
   private expire(): void {
     const now = this.now();
     if (now < this.nextSweepAtMs) return;
     let nextSweepAtMs = Infinity;
-    for (const [id, session] of this.sessions) {
+    for (const session of this.sessions.values()) {
       if (session.deleteAt <= now) {
-        this.sessions.delete(id);
+        this.removeSession(session);
         continue;
       }
       if (session.status.status === 'pending' && session.expiresAt <= now) {
-        session.offerSdp = '';
-        session.status = { status: 'failed' };
+        this.finishSession(session, { status: 'failed' });
       }
       const deadline = session.status.status === 'pending' ? session.expiresAt : session.deleteAt;
       if (deadline < nextSweepAtMs) nextSweepAtMs = deadline;
@@ -71,12 +123,22 @@ export class MemoryPeerSessionStore implements PeerSessionStore {
 
   create(args: { nodeId: string; ownerUserId: string; protocol: string; offerSdp: string }): string {
     this.expire();
-    if (this.sessions.size >= this.maxSessions) throw new Error('peer_capacity');
-    let count = 0;
-    for (const session of this.sessions.values()) {
-      if (session.ownerUserId === args.ownerUserId && session.status.status === 'pending') count++;
+    const ownerCount = this.ownerSessions.get(args.ownerUserId)?.size ?? 0;
+    const terminalCount = this.terminalByOwner.get(args.ownerUserId)?.size ?? 0;
+    if (ownerCount - terminalCount >= this.maxPendingPerUser) throw new Error('peer_capacity');
+
+    // Under pressure, reclaim only a completed/failed session; never steal an
+    // offer awaiting negotiation. Both evictions are O(1) from ordered Sets.
+    if (ownerCount >= this.maxSessionsPerUser) {
+      const oldestOwnedTerminal = this.terminalByOwner.get(args.ownerUserId)?.values().next().value;
+      if (!oldestOwnedTerminal) throw new Error('peer_capacity');
+      this.removeSession(this.sessions.get(oldestOwnedTerminal)!);
     }
-    if (count >= this.maxPendingPerUser) throw new Error('peer_capacity');
+    if (this.sessions.size >= this.maxSessions) {
+      const oldestTerminal = this.terminalSessions.values().next().value;
+      if (!oldestTerminal) throw new Error('peer_capacity');
+      this.removeSession(this.sessions.get(oldestTerminal)!);
+    }
     let sessionId = this.createId();
     if (this.sessions.has(sessionId)) sessionId = this.createId();
     if (this.sessions.has(sessionId)) throw new Error('peer_capacity');
@@ -85,6 +147,8 @@ export class MemoryPeerSessionStore implements PeerSessionStore {
       ...args, sessionId, claimed: false, status: { status: 'pending' },
       expiresAt: now + this.ttlMs, deleteAt: now + this.ttlMs + this.retentionMs,
     });
+    this.addIndex(this.ownerSessions, args.ownerUserId, sessionId);
+    this.addIndex(this.claimableByNode, args.nodeId, sessionId);
     if (now + this.ttlMs < this.nextSweepAtMs) this.nextSweepAtMs = now + this.ttlMs;
     return sessionId;
   }
@@ -98,23 +162,23 @@ export class MemoryPeerSessionStore implements PeerSessionStore {
 
   claim(nodeId: string): PeerOffer | undefined {
     this.expire();
-    for (const session of this.sessions.values()) {
-      if (session.nodeId !== nodeId || session.claimed || session.status.status !== 'pending') continue;
-      session.claimed = true;
-      return {
-        sessionId: session.sessionId, nodeId: session.nodeId,
-        ownerUserId: session.ownerUserId, protocol: session.protocol, offerSdp: session.offerSdp,
-      };
-    }
-    return undefined;
+    const sessionId = this.claimableByNode.get(nodeId)?.values().next().value;
+    if (!sessionId) return undefined;
+    const session = this.sessions.get(sessionId)!;
+    this.removeIndex(this.claimableByNode, nodeId, sessionId);
+    session.claimed = true;
+    return {
+      sessionId: session.sessionId, nodeId: session.nodeId,
+      ownerUserId: session.ownerUserId, protocol: session.protocol, offerSdp: session.offerSdp,
+    };
   }
 
   answer(nodeId: string, sessionId: string, result: { answerSdp?: string; failed?: true }): boolean {
     this.expire();
     const session = this.sessions.get(sessionId);
     if (!session || session.nodeId !== nodeId || !session.claimed || session.status.status !== 'pending') return false;
-    session.status = result.failed ? { status: 'failed' } : { status: 'answered', answerSdp: result.answerSdp! };
-    session.offerSdp = '';
+    this.finishSession(session, result.failed
+      ? { status: 'failed' } : { status: 'answered', answerSdp: result.answerSdp! });
     session.deleteAt = this.now() + this.retentionMs;
     if (session.deleteAt < this.nextSweepAtMs) this.nextSweepAtMs = session.deleteAt;
     return true;
@@ -124,9 +188,9 @@ export class MemoryPeerSessionStore implements PeerSessionStore {
     this.expire();
     const session = this.sessions.get(sessionId);
     if (!session || session.ownerUserId !== ownerUserId) return;
-    // Explicit cancellation needs no retained SDP/status row. Immediate deletion
-    // frees capacity and fences an in-flight node answer without another scan.
-    this.sessions.delete(sessionId);
+    // Explicit cancellation frees pending or terminal capacity immediately and
+    // fences any in-flight node answer, with no scan or retained tombstone.
+    this.removeSession(session);
   }
 }
 

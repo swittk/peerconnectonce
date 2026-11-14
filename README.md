@@ -20,7 +20,11 @@ Authentication, node discovery, ICE/STUN/TURN policy and service authorization a
 by the embedding application. The core exposes no unrestricted LAN or file proxy.
 Signaling carries short-lived offers and answers; application data goes via peer channels
 or a TURN relay when needed. Signal storage is in-memory by default; multi-replica
-deployments must provide shared storage or consistent routing.
+deployments must provide shared storage or consistent routing. The memory store
+enforces total, per-user pending, and per-user retained-session limits. Under
+capacity pressure it evicts the oldest completed/failed signaling rows first,
+never an in-flight offer; clients should handle an evicted/expired status as
+a failed negotiation and retry with a fresh session.
 
 The runtime has bounded data-channel queues and flow control, without an arbitrary
 bandwidth limit enabled by default. A bandwidth policy is opt-in.

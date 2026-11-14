@@ -5,6 +5,8 @@ function channel() {
   let sendCount = 0;
   const sent: (string | Buffer)[] = [];
   let onLow = () => {};
+  let subscribed = false;
+  let onSubscribe: (() => void) | undefined;
   let bufferedAmount = 0;
   return {
     get readyState() { return 'open' as const; },
@@ -13,8 +15,15 @@ function channel() {
     bufferedAmountLowThreshold: 0,
     bufferedAmountLow: { subscribe(fn: () => void) {
       onLow = fn;
+      subscribed = true;
+      onSubscribe?.();
+      onSubscribe = undefined;
       return { unSubscribe() { onLow = () => {}; } };
     } },
+    whenWaiting(): Promise<void> {
+      if (subscribed) return Promise.resolve();
+      return new Promise<void>((resolve) => { onSubscribe = resolve; });
+    },
     send(data: string | Buffer) { sent.push(data); sendCount++; },
     close() {},
     emitLow() { onLow(); },
@@ -111,6 +120,12 @@ describe('bounded writer, no artificial default throttle', () => {
     });
     const first = writer.sendBinary(new Uint8Array(32));
     await expect(writer.sendBinary(new Uint8Array(32))).rejects.toThrow('peer_writer_capacity');
+    // Wait for actual transport backpressure, not a fixed timeout or queue-cap side effect.
+    await Promise.race([
+      fake.whenWaiting(),
+      first.then(() => { throw new Error('writer_bypassed_backpressure'); }),
+    ]);
+    expect(fake.sendCount).toBe(0);
     fake.bufferedAmount = 0;
     fake.emitLow();
     await first;
