@@ -266,7 +266,11 @@ export class PeerServer {
       }
     } finally {
       this.running = false;
-      await Promise.allSettled([...this.livePeers.values()].map((peer) => peer.close()));
+      const closes: Promise<void>[] = [];
+      for (const peer of this.livePeers.values()) {
+        closes.push(peer.close().catch(() => undefined));
+      }
+      await Promise.all(closes);
     }
   }
 

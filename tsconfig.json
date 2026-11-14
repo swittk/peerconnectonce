@@ -1,9 +1,13 @@
 {
   "compilerOptions": {
-    "target": "ES2022",
+    "target": "ES2018",
     "module": "ESNext",
     "moduleResolution": "Bundler",
-    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "lib": [
+      "ES2018",
+      "DOM",
+      "DOM.Iterable"
+    ],
     "strict": true,
     "declaration": true,
     "outDir": "dist",
@@ -13,6 +17,12 @@
     "forceConsistentCasingInFileNames": true,
     "noUncheckedIndexedAccess": true
   },
-  "include": ["src/**/*.ts"],
-  "exclude": ["dist", "dist-cjs", "tests"]
+  "include": [
+    "src/**/*.ts"
+  ],
+  "exclude": [
+    "dist",
+    "dist-cjs",
+    "tests"
+  ]
 }

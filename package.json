@@ -65,7 +65,7 @@
     "build": "pnpm clean && pnpm build:esm && pnpm build:cjs",
     "test": "vitest run",
     "smoke:browser": "node scripts/smoke-browser.mjs",
-    "check": "pnpm typecheck && pnpm test && pnpm build && node scripts/check-exports.mjs"
+    "check": "pnpm typecheck && pnpm test && pnpm build && node scripts/check-exports.mjs && node scripts/check-es2018.mjs"
   },
   "peerDependencies": {
     "werift": "^0.27.0"
@@ -77,6 +77,7 @@
   },
   "devDependencies": {
     "@types/node": "^22.15.2",
+    "acorn": "^8.19.0",
     "typescript": "^5.9.0",
     "vitest": "^4.0.5",
     "werift": "0.27.0"

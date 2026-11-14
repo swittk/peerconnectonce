@@ -2,6 +2,8 @@
 
 A generic peer-to-peer connection toolkit, independent of application frameworks and services.
 
+**JavaScript output targets ES2018 (both ESM and CommonJS)**. This is a syntax/library target, not a promise that every ES2018-era runtime exposes WebRTC, Fetch or modern Web Crypto. The Node server's supported runtime floor remains Node.js 20; browser clients require native WebRTC or a supplied platform implementation.
+
 Package: @peerconnectonce/core
 
 Four public entry points:
