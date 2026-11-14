@@ -526,6 +526,10 @@ export function createHttpNodeSignaling(options: HttpNodeSignalingOptions): Peer
       });
       const headers = new Headers(headerValues);
       if (body) headers.set('content-type', 'application/json');
+      // A shutdown microtask can fire after credential resolution but before
+      // this continuation runs. Do not dispatch an already-aborted request,
+      // even with custom Fetch implementations that ignore AbortSignal.
+      if (controller.signal.aborted) throw new Error('peer_request_aborted');
       const response = await fetchImpl(base + path, {
         method: body ? 'POST' : 'GET', headers, signal: controller.signal,
         ...(body ? { body: JSON.stringify(body) } : {}),

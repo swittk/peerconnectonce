@@ -33,6 +33,28 @@ function channel() {
 }
 
 describe('bounded HTTP node signaling', () => {
+  it('never calls fetch if shutdown lands after header resolution but before dispatch', async () => {
+    const shutdown = new AbortController();
+    let fetches = 0;
+    const node = createHttpNodeSignaling({
+      baseUrl: 'https://broker.example/peer',
+      nodeId: 'node-a',
+      headers: () => {
+        // The header promise can resolve before this nested microtask abort.
+        // Check again immediately before dispatching the network request.
+        queueMicrotask(() => queueMicrotask(() => shutdown.abort()));
+        return {};
+      },
+      fetch: async () => {
+        fetches++;
+        return new Response(null, { status: 204 });
+      },
+    });
+    await expect(node.claim(shutdown.signal)).rejects.toThrow('peer_request_aborted');
+    expect(shutdown.signal.aborted).toBe(true);
+    expect(fetches).toBe(0);
+  });
+
   it('times out asynchronous credential headers before calling fetch', async () => {
     let fetches = 0;
     const node = createHttpNodeSignaling({
