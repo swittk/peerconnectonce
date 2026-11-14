@@ -3,7 +3,7 @@ import { readFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { resolve, dirname } from 'node:path';
-import { createPeerSignalHandler } from '../dist/signal/index.js';
+import { createPeerSignalHandler, MemoryPeerSessionStore } from '../dist/signal/index.js';
 import { createHttpNodeSignaling, PeerServer } from '../dist/server/index.js';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -25,6 +25,9 @@ const signalHandler = createPeerSignalHandler({
   allowedProtocols: ['echo-v1'],
   resolveNode: async () => 'node-a',
   getIceServers: async () => [],
+  // A second browser session must depend on the first browser explicitly
+  // acknowledging its answer; otherwise the first is protected from eviction.
+  store: new MemoryPeerSessionStore({ maxSessions: 1, maxSessionsPerUser: 1, maxPendingPerUser: 1 }),
 });
 
 const server = createServer(async (request, response) => {

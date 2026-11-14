@@ -238,7 +238,6 @@ export class PeerClient {
     let peer: ClientPeerConnection | undefined;
     let channel: ClientPeerChannel | undefined;
     let sessionId: string | undefined;
-    let didReceiveAnswer = false;
     let alreadyClosed = false;
     let attemptClosed = false;
     const closeAttempt = () => {
@@ -308,8 +307,18 @@ export class PeerClient {
         else await underDeadline(sleep(this.answerPollIntervalMs, signal), deadline, signal, 'answer_poll');
       }
       await underDeadline(peer.setRemoteDescription({ type: 'answer', sdp: answer }), deadline, signal, 'remote_description');
-      didReceiveAnswer = true;
       await waitForChannel(peer, channel, deadline, signal);
+      // Only the browser that successfully received/applied the answer can
+      // acknowledge it. Until this arrives, the signaling store protects
+      // the answer from eviction by another user's connection attempt.
+      if (this.signaling.acknowledgeOffer) {
+        const acknowledgeController = new AbortController();
+        const acknowledgeTimer = setTimeout(() => acknowledgeController.abort(), 5_000);
+        void Promise.resolve()
+          .then(() => this.signaling.acknowledgeOffer!(sessionId!, acknowledgeController.signal))
+          .catch(() => undefined)
+          .finally(() => clearTimeout(acknowledgeTimer));
+      }
       const handlePeerState = () => {
         if (peer?.connectionState === 'failed' || peer?.connectionState === 'closed') close();
       };
@@ -328,8 +337,13 @@ export class PeerClient {
       return result;
     } catch (error) {
       close();
-      if (sessionId && !didReceiveAnswer) {
-        void this.signaling.cancelOffer?.(sessionId).catch(() => undefined);
+      if (sessionId && this.signaling.cancelOffer) {
+        const cancelController = new AbortController();
+        const cancelTimer = setTimeout(() => cancelController.abort(), 5_000);
+        void Promise.resolve()
+          .then(() => this.signaling.cancelOffer!(sessionId!, cancelController.signal))
+          .catch(() => undefined)
+          .finally(() => clearTimeout(cancelTimer));
       }
       throw error;
     }
@@ -386,6 +400,9 @@ export function createHttpClientSignaling(options: HttpClientSignalingOptions): 
       const value = await request('/sessions/' + encodeURIComponent(sessionId), { signal });
       if (!value || typeof (value as PeerSessionStatus).status !== 'string') throw new Error('invalid_peer_answer');
       return value as PeerSessionStatus;
+    },
+    async acknowledgeOffer(sessionId, signal) {
+      await request('/sessions/' + encodeURIComponent(sessionId) + '/ack', { method: 'POST', signal });
     },
     async cancelOffer(sessionId, signal) {
       await request('/sessions/' + encodeURIComponent(sessionId), { method: 'DELETE', signal });

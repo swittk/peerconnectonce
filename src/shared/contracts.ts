@@ -27,6 +27,8 @@ export interface PeerClientSignaling {
   getIceServers(options: { protocol: string; nodeId?: string; signal?: AbortSignal }): Promise<PeerIceServer[]>;
   createOffer(args: { protocol: string; offerSdp: string; nodeId?: string; signal?: AbortSignal }): Promise<PeerSessionCreation>;
   readAnswer(sessionId: string, signal?: AbortSignal): Promise<PeerSessionStatus>;
+  /** Marks one terminal answer safe for capacity-driven eviction after the client received it. */
+  acknowledgeOffer?(sessionId: string, signal?: AbortSignal): Promise<void>;
   cancelOffer?(sessionId: string, signal?: AbortSignal): Promise<void>;
 }
 

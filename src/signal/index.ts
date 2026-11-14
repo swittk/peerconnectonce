@@ -10,6 +10,8 @@ export type PeerSessionStore = {
   read(sessionId: string, ownerUserId: string): Promise<PeerSessionStatus | undefined> | PeerSessionStatus | undefined;
   claim(nodeId: string): Promise<PeerOffer | undefined> | PeerOffer | undefined;
   answer(nodeId: string, sessionId: string, result: { answerSdp?: string; failed?: true }): Promise<boolean> | boolean;
+  /** Receipt acknowledgement, distinct from reading or cancelling a session. */
+  acknowledge(sessionId: string, ownerUserId: string): Promise<void> | void;
   cancel(sessionId: string, ownerUserId: string): Promise<void> | void;
 };
 
@@ -27,6 +29,7 @@ export type MemoryPeerSessionStoreOptions = {
 type StoredSession = PeerOffer & {
   status: PeerSessionStatus;
   claimed: boolean;
+  acknowledged: boolean;
   expiresAt: number;
   deleteAt: number;
 };
@@ -39,6 +42,8 @@ type StoredSession = PeerOffer & {
 export class MemoryPeerSessionStore implements PeerSessionStore {
   private readonly sessions = new Map<string, StoredSession>();
   private readonly ownerSessions = new Map<string, Set<string>>();
+  private readonly pendingCountByOwner = new Map<string, number>();
+  /** Only acknowledged terminal sessions may be reclaimed under capacity pressure. */
   private readonly terminalByOwner = new Map<string, Set<string>>();
   private readonly terminalSessions = new Set<string>();
   private readonly claimableByNode = new Map<string, Set<string>>();
@@ -82,25 +87,32 @@ export class MemoryPeerSessionStore implements PeerSessionStore {
     if (ids.size === 0) index.delete(key);
   }
 
+  /** One indexed pending-count transition, without scanning this owner's sessions. */
+  private changePendingCount(ownerUserId: string, difference: number): void {
+    const next = (this.pendingCountByOwner.get(ownerUserId) ?? 0) + difference;
+    if (next === 0) this.pendingCountByOwner.delete(ownerUserId);
+    else this.pendingCountByOwner.set(ownerUserId, next);
+  }
+
   /** Delete one session from all indexes without a scan or retained tombstone. */
   private removeSession(session: StoredSession): void {
     this.sessions.delete(session.sessionId);
     this.removeIndex(this.ownerSessions, session.ownerUserId, session.sessionId);
     if (session.status.status === 'pending') {
+      this.changePendingCount(session.ownerUserId, -1);
       if (!session.claimed) this.removeIndex(this.claimableByNode, session.nodeId, session.sessionId);
-    } else {
+    } else if (session.acknowledged) {
       this.removeIndex(this.terminalByOwner, session.ownerUserId, session.sessionId);
       this.terminalSessions.delete(session.sessionId);
     }
   }
 
-  /** Retain the terminal status but remove a pending offer from the node queue. */
+  /** Retain an unacknowledged answer/failure so no other user's offer can steal it. */
   private finishSession(session: StoredSession, status: PeerSessionStatus): void {
     if (!session.claimed) this.removeIndex(this.claimableByNode, session.nodeId, session.sessionId);
+    this.changePendingCount(session.ownerUserId, -1);
     session.status = status;
     session.offerSdp = '';
-    this.addIndex(this.terminalByOwner, session.ownerUserId, session.sessionId);
-    this.terminalSessions.add(session.sessionId);
   }
 
   private expire(): void {
@@ -124,11 +136,13 @@ export class MemoryPeerSessionStore implements PeerSessionStore {
   create(args: { nodeId: string; ownerUserId: string; protocol: string; offerSdp: string }): string {
     this.expire();
     const ownerCount = this.ownerSessions.get(args.ownerUserId)?.size ?? 0;
-    const terminalCount = this.terminalByOwner.get(args.ownerUserId)?.size ?? 0;
-    if (ownerCount - terminalCount >= this.maxPendingPerUser) throw new Error('peer_capacity');
+    if ((this.pendingCountByOwner.get(args.ownerUserId) ?? 0) >= this.maxPendingPerUser) {
+      throw new Error('peer_capacity');
+    }
 
-    // Under pressure, reclaim only a completed/failed session; never steal an
-    // offer awaiting negotiation. Both evictions are O(1) from ordered Sets.
+    // Under pressure, reclaim only a terminal result explicitly acknowledged
+    // by its owner. Unread answers, failures and all pending offers are protected.
+    // Both safe evictions are O(1) from insertion-ordered Sets.
     if (ownerCount >= this.maxSessionsPerUser) {
       const oldestOwnedTerminal = this.terminalByOwner.get(args.ownerUserId)?.values().next().value;
       if (!oldestOwnedTerminal) throw new Error('peer_capacity');
@@ -144,10 +158,11 @@ export class MemoryPeerSessionStore implements PeerSessionStore {
     if (this.sessions.has(sessionId)) throw new Error('peer_capacity');
     const now = this.now();
     this.sessions.set(sessionId, {
-      ...args, sessionId, claimed: false, status: { status: 'pending' },
+      ...args, sessionId, claimed: false, acknowledged: false, status: { status: 'pending' },
       expiresAt: now + this.ttlMs, deleteAt: now + this.ttlMs + this.retentionMs,
     });
     this.addIndex(this.ownerSessions, args.ownerUserId, sessionId);
+    this.changePendingCount(args.ownerUserId, 1);
     this.addIndex(this.claimableByNode, args.nodeId, sessionId);
     if (now + this.ttlMs < this.nextSweepAtMs) this.nextSweepAtMs = now + this.ttlMs;
     return sessionId;
@@ -182,6 +197,17 @@ export class MemoryPeerSessionStore implements PeerSessionStore {
     session.deleteAt = this.now() + this.retentionMs;
     if (session.deleteAt < this.nextSweepAtMs) this.nextSweepAtMs = session.deleteAt;
     return true;
+  }
+
+  /** Explicit receipt makes a terminal row evictable, but retains it until pressure/TTL. */
+  acknowledge(sessionId: string, ownerUserId: string): void {
+    this.expire();
+    const session = this.sessions.get(sessionId);
+    if (!session || session.ownerUserId !== ownerUserId ||
+        session.status.status === 'pending' || session.acknowledged) return;
+    session.acknowledged = true;
+    this.addIndex(this.terminalByOwner, session.ownerUserId, sessionId);
+    this.terminalSessions.add(sessionId);
   }
 
   cancel(sessionId: string, ownerUserId: string): void {
@@ -331,6 +357,13 @@ export function createPeerSignalHandler(options: PeerSignalHandlerOptions): (req
         const iceServers = readPeerIceServers(await options.getIceServers(node));
         const sessionId = await store.create({ nodeId: node, ownerUserId: user, protocol: body.protocol, offerSdp: body.offerSdp });
         return answer({ sessionId, iceServers }, 201);
+      }
+      const acknowledgeMatch = /^sessions\/([a-zA-Z0-9_-]{1,128})\/ack$/.exec(route);
+      if (acknowledgeMatch && request.method === 'POST') {
+        const user = await browserUser();
+        if (!user) return answer({ error: 'unauthorized' }, 401);
+        await store.acknowledge(acknowledgeMatch[1]!, user);
+        return empty();
       }
       const sessionMatch = /^sessions\/([a-zA-Z0-9_-]{1,128})$/.exec(route);
       if (sessionMatch && (request.method === 'GET' || request.method === 'DELETE')) {

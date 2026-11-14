@@ -68,6 +68,7 @@ describe('MemoryPeerSessionStore', () => {
         isFailure ? { failed: true } : { answerSdp: 'response-' + i })).toBe(true);
       expect(store.read(id, 'noisy')).toEqual(isFailure
         ? { status: 'failed' } : { status: 'answered', answerSdp: 'response-' + i });
+      store.acknowledge(id, 'noisy');
     }
     expect(store.read(firstNoisy!, 'noisy')).toBeUndefined();
     expect(store.read(lastNoisy, 'noisy')).toEqual({ status: 'answered', answerSdp: 'response-39' });
@@ -90,6 +91,7 @@ describe('MemoryPeerSessionStore', () => {
     expect(store.claim('node')?.sessionId).toBe(pending);
     expect(store.claim('node')?.sessionId).toBe(completed);
     expect(store.answer('node', completed, { answerSdp: 'done' })).toBe(true);
+    store.acknowledge(completed, 'completed-owner');
     const failed = store.create(row('failed-owner'));
     expect(store.claim('node')?.sessionId).toBe(failed);
     expect(store.answer('node', failed, { failed: true })).toBe(true);
@@ -99,6 +101,78 @@ describe('MemoryPeerSessionStore', () => {
     expect(store.read(pending, 'pending-owner')).toEqual({ status: 'pending' });
     expect(store.claim('node')?.sessionId).toBe(newcomer);
     expect(store.answer('node', completed, { answerSdp: 'late' })).toBe(false);
+  });
+
+  it('never evicts an answered or failed status that the owner has not acknowledged', () => {
+    let serial = 0;
+    const store = new MemoryPeerSessionStore({
+      ttlMs: 60_000, retentionMs: 60_000,
+      maxSessions: 2, maxPendingPerUser: 1, maxSessionsPerUser: 2,
+      createId: () => 'protected-' + ++serial,
+    });
+    const offer = (ownerUserId: string) =>
+      ({ nodeId: 'node', ownerUserId, protocol: 'echo-v1', offerSdp: ownerUserId });
+    const alice = store.create(offer('alice'));
+    expect(store.claim('node')?.sessionId).toBe(alice);
+    expect(store.answer('node', alice, { answerSdp: 'alice-answer' })).toBe(true);
+    const bob = store.create(offer('bob'));
+    expect(store.claim('node')?.sessionId).toBe(bob);
+    expect(store.answer('node', bob, { failed: true })).toBe(true);
+    // Even a completed body read is not a receipt ACK. Other users must not
+    // steal either result when the signaling store is fully occupied.
+    expect(store.read(alice, 'alice')).toEqual({ status: 'answered', answerSdp: 'alice-answer' });
+    expect(() => store.create(offer('newcomer'))).toThrow('peer_capacity');
+    store.acknowledge(bob, 'alice'); // wrong owner cannot acknowledge a result
+    expect(() => store.create(offer('newcomer'))).toThrow('peer_capacity');
+    expect(store.read(alice, 'alice')).toEqual({ status: 'answered', answerSdp: 'alice-answer' });
+    store.acknowledge(bob, 'bob');
+    const newcomer = store.create(offer('newcomer'));
+    expect(store.read(alice, 'alice')).toEqual({ status: 'answered', answerSdp: 'alice-answer' });
+    expect(store.read(bob, 'bob')).toBeUndefined();
+    expect(store.claim('node')?.sessionId).toBe(newcomer);
+    expect(store.answer('node', bob, { answerSdp: 'late' })).toBe(false);
+  });
+
+  it('enforces a per-user limit for unacknowledged terminal results until receipt or expiry', () => {
+    let serial = 0;
+    const store = new MemoryPeerSessionStore({
+      maxSessions: 5, maxPendingPerUser: 2, maxSessionsPerUser: 2,
+      createId: () => 'owner-' + ++serial,
+    });
+    const input = { nodeId: 'node', ownerUserId: 'busy', protocol: 'echo-v1', offerSdp: 'x' };
+    const a = store.create(input);
+    expect(store.claim('node')?.sessionId).toBe(a);
+    store.answer('node', a, { answerSdp: 'result' });
+    const b = store.create(input);
+    expect(store.claim('node')?.sessionId).toBe(b);
+    store.answer('node', b, { failed: true });
+    expect(() => store.create(input)).toThrow('peer_capacity');
+    store.acknowledge(a, 'busy');
+    const c = store.create(input);
+    expect(store.read(a, 'busy')).toBeUndefined();
+    expect(store.read(b, 'busy')).toEqual({ status: 'failed' });
+    expect(store.claim('node')?.sessionId).toBe(c);
+  });
+
+  it('expires an unacknowledged terminal result without requiring an acknowledgement', () => {
+    let now = 1_000;
+    let serial = 0;
+    const store = new MemoryPeerSessionStore({
+      ttlMs: 10, retentionMs: 20,
+      maxSessions: 1, maxSessionsPerUser: 1, maxPendingPerUser: 1,
+      now: () => now,
+      createId: () => 'expire-' + ++serial,
+    });
+    const first = store.create({ nodeId: 'node', ownerUserId: 'alice', protocol: 'echo-v1', offerSdp: 'first' });
+    expect(store.claim('node')?.sessionId).toBe(first);
+    expect(store.answer('node', first, { answerSdp: 'answer' })).toBe(true);
+    expect(() => store.create({
+      nodeId: 'node', ownerUserId: 'bob', protocol: 'echo-v1', offerSdp: 'second',
+    })).toThrow('peer_capacity');
+    now += 21;
+    expect(store.read(first, 'alice')).toBeUndefined();
+    const second = store.create({ nodeId: 'node', ownerUserId: 'bob', protocol: 'echo-v1', offerSdp: 'second' });
+    expect(store.claim('node')?.sessionId).toBe(second);
   });
 
   it('rejects capacity overflow when all sessions are pending rather than silently evicting work', () => {
@@ -181,6 +255,45 @@ describe('framework-neutral HTTP signaling', () => {
     await expect(node.answer(created.sessionId, 'replay')).rejects.toThrow('peer_answer_http_409');
     await expect(browser.createOffer({ protocol: 'unregistered', offerSdp: 'anything' })).rejects.toThrow('peer_signal_http_403');
     await expect(stranger.createOffer({ protocol: 'echo-v1', offerSdp: 'anything' })).rejects.toThrow('peer_signal_http_403');
+  });
+
+  it('protects a polled answer through HTTP capacity pressure until explicit client acknowledgement', async () => {
+    let serial = 0;
+    const handler = createPeerSignalHandler({
+      allowedProtocols: ['echo-v1'],
+      getIceServers: async () => [],
+      store: new MemoryPeerSessionStore({
+        maxSessions: 1, maxPendingPerUser: 1, maxSessionsPerUser: 1,
+        createId: () => 'http-' + ++serial,
+      }),
+      authenticateClient: async (request) => {
+        const id = request.headers.get('x-test-user');
+        return id ? { userId: id } : undefined;
+      },
+      authenticateNode: async () => ({ nodeId: 'node' }),
+    });
+    const fetchLocal: typeof fetch = async (url, options) =>
+      handler(new Request(String(url), options));
+    const client = (user: string) => createHttpClientSignaling({
+      baseUrl: 'https://broker.example/peer',
+      headers: () => ({ 'x-test-user': user }),
+      fetch: fetchLocal,
+    });
+    const alice = client('alice');
+    const bob = client('bob');
+    const session = await alice.createOffer({ protocol: 'echo-v1', offerSdp: 'offer', nodeId: 'node' });
+    const node = createHttpNodeSignaling({
+      baseUrl: 'https://broker.example/peer', nodeId: 'node',
+      headers: () => ({}), fetch: fetchLocal,
+    });
+    expect((await node.claim())?.sessionId).toBe(session.sessionId);
+    await node.answer(session.sessionId, 'answer');
+    expect(await alice.readAnswer(session.sessionId)).toEqual({ status: 'answered', answerSdp: 'answer' });
+    await expect(bob.createOffer({ protocol: 'echo-v1', offerSdp: 'bob-offer' })).rejects.toThrow('peer_signal_http_429');
+    await alice.acknowledgeOffer?.(session.sessionId);
+    const bobSession = await bob.createOffer({ protocol: 'echo-v1', offerSdp: 'bob-offer', nodeId: 'node' });
+    await expect(alice.readAnswer(session.sessionId)).rejects.toThrow('peer_signal_http_404');
+    expect((await node.claim())?.sessionId).toBe(bobSession.sessionId);
   });
 
   it('cannot leak ICE credentials when the host denies the requested service', async () => {

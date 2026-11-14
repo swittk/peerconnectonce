@@ -66,6 +66,60 @@ describe('shared browser WebRTC connection lifecycle', () => {
     await expect(client.connect('echo-v1')).rejects.toThrow('peer_client_closed');
   });
 
+  it('acknowledges a session only after its data channel has opened', async () => {
+    const acknowledgedIds: string[] = [];
+    let finishAcknowledgement: (() => void) | undefined;
+    const acknowledged = new Promise<void>((resolve) => { finishAcknowledgement = resolve; });
+    const client = new PeerClient({
+      signaling: {
+        getIceServers: async () => [],
+        createOffer: async () => ({ sessionId: 'received-answer', iceServers: [] }),
+        readAnswer: async () => ({ status: 'answered', answerSdp: 'answer' }),
+        acknowledgeOffer: async (id) => {
+          acknowledgedIds.push(id);
+          finishAcknowledgement?.();
+        },
+      },
+      createPeerConnection: () => new FakePeer() as unknown as ClientPeerConnection,
+    });
+    const connected = await client.connect('echo-v1');
+    expect(connected.channel.readyState).toBe('open');
+    await acknowledged;
+    expect(acknowledgedIds).toEqual(['received-answer']);
+    client.close();
+  });
+
+  it('never acknowledges a failed connection and releases its signaling session', async () => {
+    let ackCount = 0;
+    let cancelCount = 0;
+    let reportCancellation: (() => void) | undefined;
+    const cancelled = new Promise<void>((resolve) => { reportCancellation = resolve; });
+    class FailingPeer extends FakePeer {
+      async setRemoteDescription(_description: RTCSessionDescriptionInit) {
+        throw new Error('invalid_remote_answer');
+      }
+    }
+    const client = new PeerClient({
+      signaling: {
+        getIceServers: async () => [],
+        createOffer: async () => ({ sessionId: 'bad-answer', iceServers: [] }),
+        readAnswer: async () => ({ status: 'answered', answerSdp: 'answer' }),
+        acknowledgeOffer: async () => { ackCount++; },
+        cancelOffer: async (id) => {
+          expect(id).toBe('bad-answer');
+          cancelCount++;
+          reportCancellation?.();
+        },
+      },
+      createPeerConnection: () => new FailingPeer() as unknown as ClientPeerConnection,
+    });
+    await expect(client.connect('echo-v1')).rejects.toThrow('invalid_remote_answer');
+    await cancelled;
+    expect(ackCount).toBe(0);
+    expect(cancelCount).toBe(1);
+    client.close();
+  });
+
   it('rejects different service on one live client and cannot silently reuse an old channel', async () => {
     const client = new PeerClient({
       signaling: {
