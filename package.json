@@ -1,0 +1,84 @@
+{
+  "name": "@peerconnectonce/core",
+  "version": "0.0.1",
+  "private": true,
+  "license": "UNLICENSED",
+  "description": "Transport-neutral peer connectivity with pluggable WebRTC clients, server runtimes and signaling.",
+  "type": "module",
+  "sideEffects": false,
+  "packageManager": "pnpm@10.26.0",
+  "engines": {
+    "node": ">=20"
+  },
+  "exports": {
+    "./client": {
+      "import": {
+        "types": "./dist/client/index.d.ts",
+        "default": "./dist/client/index.js"
+      },
+      "require": {
+        "types": "./dist-cjs/client/index.d.ts",
+        "default": "./dist-cjs/client/index.js"
+      }
+    },
+    "./browser": {
+      "import": {
+        "types": "./dist/browser/index.d.ts",
+        "default": "./dist/browser/index.js"
+      },
+      "require": {
+        "types": "./dist-cjs/browser/index.d.ts",
+        "default": "./dist-cjs/browser/index.js"
+      }
+    },
+    "./server": {
+      "import": {
+        "types": "./dist/server/index.d.ts",
+        "default": "./dist/server/index.js"
+      },
+      "require": {
+        "types": "./dist-cjs/server/index.d.ts",
+        "default": "./dist-cjs/server/index.js"
+      }
+    },
+    "./signal": {
+      "import": {
+        "types": "./dist/signal/index.d.ts",
+        "default": "./dist/signal/index.js"
+      },
+      "require": {
+        "types": "./dist-cjs/signal/index.d.ts",
+        "default": "./dist-cjs/signal/index.js"
+      }
+    }
+  },
+  "files": [
+    "dist",
+    "dist-cjs",
+    "README.md"
+  ],
+  "scripts": {
+    "clean": "node ./scripts/clean.mjs",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "build:esm": "tsc -p tsconfig.json",
+    "build:cjs": "tsc -p tsconfig.cjs.json && node scripts/write-cjs-package.mjs",
+    "build": "pnpm clean && pnpm build:esm && pnpm build:cjs",
+    "test": "vitest run",
+    "smoke:browser": "node scripts/smoke-browser.mjs",
+    "check": "pnpm typecheck && pnpm test && pnpm build && node scripts/check-exports.mjs"
+  },
+  "peerDependencies": {
+    "werift": "^0.27.0"
+  },
+  "peerDependenciesMeta": {
+    "werift": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.2",
+    "typescript": "^5.9.0",
+    "vitest": "^4.0.5",
+    "werift": "0.27.0"
+  }
+}
