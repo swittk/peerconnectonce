@@ -1,9 +1,10 @@
 import { execFileSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 
-const tsc = new URL('../node_modules/typescript/bin/tsc', import.meta.url).pathname;
+const tsc = fileURLToPath(new URL('../node_modules/typescript/bin/tsc', import.meta.url));
 const files = [
-  new URL('../tests/consumer-node-only.mts', import.meta.url).pathname,
-  new URL('../tests/consumer-node-only.cts', import.meta.url).pathname,
+  fileURLToPath(new URL('../tests/consumer-node-only.mts', import.meta.url)),
+  fileURLToPath(new URL('../tests/consumer-node-only.cts', import.meta.url)),
 ];
 execFileSync(process.execPath, [
   tsc,

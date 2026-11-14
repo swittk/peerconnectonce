@@ -7,6 +7,8 @@ import {
   createHttpNodeSignaling,
 } from '@peerconnectonce/core/server';
 import { createPeerSignalHandler } from '@peerconnectonce/core/signal';
+import { PeerClient, createHttpClientSignaling } from '@peerconnectonce/core/client';
+import { BrowserPeerClient } from '@peerconnectonce/core/browser';
 
 const config: PeerServerOptions = {
   signaling: {
@@ -21,4 +23,5 @@ const config: PeerServerOptions = {
   iceServers: [],
 };
 void [PeerServer, PeerServiceRegistry, BoundedPeerWriter, config,
-  createHttpNodeSignaling, createPeerSignalHandler];
+  createHttpNodeSignaling, createPeerSignalHandler, PeerClient,
+  createHttpClientSignaling, BrowserPeerClient];

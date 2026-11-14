@@ -1,5 +1,5 @@
 import { RTCPeerConnection, type RTCDataChannel } from 'werift';
-import type { PeerIceServer } from '../shared/contracts.js';
+import type { PeerIceServer, PeerHttpHeaders } from '../shared/contracts.js';
 import {
   isPeerLabel, type PeerNodeSignaling, type PeerOffer,
 } from '../shared/contracts.js';
@@ -325,6 +325,7 @@ export class PeerServer {
 
   /** Also usable by an onsite backend without starting an outbound polling loop. */
   async accept(offer: PeerOffer, shutdownSignal: AbortSignal): Promise<RunningPeer> {
+    if (shutdownSignal.aborted) throw new Error('peer_setup_stopped');
     if (!this.registry.has(offer.protocol)) throw new Error('unregistered_peer_service');
     const controller = new AbortController();
     const connection = new RTCPeerConnection({
@@ -357,19 +358,28 @@ export class PeerServer {
     const maxIncomingQueueBytes = this.options.maxQueuedBytes ?? 8 * 1024 * 1024;
     const maxIncomingMessages = this.options.maxQueuedMessages ?? 1024;
     const maxIncomingFrameBytes = this.options.maxMessageBytes ?? 64 * 1024;
-    const close = async () => {
-      if (alreadyClosed) return;
+    // The existing finished promise doubles as the one idempotent close promise:
+    // concurrent shutdown callers must await the SAME cleanup, not return early.
+    const close = (): Promise<void> => {
+      if (alreadyClosed) return finished;
       alreadyClosed = true;
       controller.abort();
       clearInterval(idleCheck);
       shutdownSignal.removeEventListener('abort', onShutdown);
-      try { await session?.close(); } catch { /* best-effort service cleanup */ }
-      if (channel?.readyState === 'open') channel.close();
-      try { await connection.close(); } catch { /* already closed */ }
-      finishedCallback();
+      void (async () => {
+        try {
+          try { await session?.close(); } catch { /* best-effort service cleanup */ }
+          try { if (channel?.readyState === 'open') channel.close(); } catch { /* already closed */ }
+          try { await connection.close(); } catch { /* already closed */ }
+        } finally {
+          finishedCallback();
+        }
+      })();
+      return finished;
     };
     const onShutdown = () => void close();
     shutdownSignal.addEventListener('abort', onShutdown, { once: true });
+    if (shutdownSignal.aborted) void close();
     connection.connectionStateChange.subscribe((state) => {
       if (state === 'failed' || state === 'closed') void close();
     });
@@ -468,9 +478,8 @@ export { PeerServer as PeerGatewayOnce };
 export type HttpNodeSignalingOptions = {
   baseUrl: string;
   nodeId: string;
-  /** Node Fetch headers, without depending on browser-only DOM type declarations. */
-  headers: () => Record<string, string> | Headers | [string, string][] |
-    Promise<Record<string, string> | Headers | [string, string][]>;
+  /** Host-provided Fetch headers, without DOM-only HeadersInit declarations. */
+  headers: () => PeerHttpHeaders | Promise<PeerHttpHeaders>;
   fetch?: typeof fetch;
   requestTimeoutMs?: number;
 };
@@ -487,7 +496,35 @@ export function createHttpNodeSignaling(options: HttpNodeSignalingOptions): Peer
     if (signal?.aborted) controller.abort();
     const timer = setTimeout(stop, options.requestTimeoutMs ?? 15_000);
     try {
-      const headers = new Headers(await options.headers());
+      // Credential refresh may be async and may ignore AbortSignal. Race it
+      // against the existing request controller so shutdown/timeout settles
+      // promptly and cannot proceed to fetch with stale credentials.
+      const headerValues = await new Promise<PeerHttpHeaders>((resolve, reject) => {
+        if (controller.signal.aborted) {
+          reject(new Error('peer_request_aborted'));
+          return;
+        }
+        const onAbort = () => {
+          controller.signal.removeEventListener('abort', onAbort);
+          reject(new Error('peer_request_aborted'));
+        };
+        controller.signal.addEventListener('abort', onAbort, { once: true });
+        Promise.resolve().then(() => {
+          if (controller.signal.aborted) throw new Error('peer_request_aborted');
+          return options.headers();
+        }).then(
+          (value) => {
+            controller.signal.removeEventListener('abort', onAbort);
+            if (controller.signal.aborted) reject(new Error('peer_request_aborted'));
+            else resolve(value);
+          },
+          (error: unknown) => {
+            controller.signal.removeEventListener('abort', onAbort);
+            reject(error);
+          }
+        );
+      });
+      const headers = new Headers(headerValues);
       if (body) headers.set('content-type', 'application/json');
       const response = await fetchImpl(base + path, {
         method: body ? 'POST' : 'GET', headers, signal: controller.signal,

@@ -64,7 +64,7 @@
     "build:cjs": "tsc -p tsconfig.cjs.json && node scripts/write-cjs-package.mjs",
     "build": "pnpm clean && pnpm build:esm && pnpm build:cjs",
     "test": "vitest run",
-    "smoke:browser": "node scripts/smoke-browser.mjs",
+    "smoke:browser": "pnpm build && node scripts/smoke-browser.mjs",
     "check": "pnpm typecheck && pnpm test && pnpm build && node scripts/check-exports.mjs && node scripts/check-es2018.mjs && node scripts/check-node-types.mjs"
   },
   "peerDependencies": {

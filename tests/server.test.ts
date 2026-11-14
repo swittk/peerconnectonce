@@ -33,6 +33,52 @@ function channel() {
 }
 
 describe('bounded HTTP node signaling', () => {
+  it('times out asynchronous credential headers before calling fetch', async () => {
+    let fetches = 0;
+    const node = createHttpNodeSignaling({
+      baseUrl: 'https://broker.example/peer',
+      nodeId: 'node-a',
+      requestTimeoutMs: 40,
+      headers: () => new Promise<Record<string, string>>(() => undefined),
+      fetch: async () => {
+        fetches++;
+        return new Response(null, { status: 204 });
+      },
+    });
+    const started = Date.now();
+    await expect(node.claim()).rejects.toThrow('peer_request_aborted');
+    expect(fetches).toBe(0);
+    expect(Date.now() - started).toBeLessThan(400);
+  });
+
+  it('does not send a request when shutdown aborts async header generation', async () => {
+    let startHeaders: (() => void) | undefined;
+    const headersStarted = new Promise<void>((resolve) => { startHeaders = resolve; });
+    let releaseHeaders: (() => void) | undefined;
+    const stalledHeaders = new Promise<Record<string, string>>((resolve) => {
+      releaseHeaders = () => resolve({ authorization: 'Bearer stale' });
+    });
+    let fetches = 0;
+    const stop = new AbortController();
+    const node = createHttpNodeSignaling({
+      baseUrl: 'https://broker.example/peer',
+      nodeId: 'node-a',
+      requestTimeoutMs: 30_000,
+      headers: () => { startHeaders?.(); return stalledHeaders; },
+      fetch: async () => {
+        fetches++;
+        return new Response(null, { status: 204 });
+      },
+    });
+    const pending = node.claim(stop.signal);
+    await headersStarted;
+    stop.abort();
+    await expect(pending).rejects.toThrow('peer_request_aborted');
+    releaseHeaders?.();
+    await Promise.resolve();
+    expect(fetches).toBe(0);
+  });
+
   it('cancels a response body stalled after headers on timeout', async () => {
     let aborted = false;
     const node = createHttpNodeSignaling({

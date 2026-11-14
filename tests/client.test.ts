@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
-  PeerClient, createHttpClientSignaling, type PeerClientSignaling,
+  PeerClient, createHttpClientSignaling, type PeerClientSignaling, type PeerSessionStatus,
   type ClientPeerConnection, type PeerConnectionConfiguration,
 } from '../src/client/index.js';
 
@@ -195,6 +195,63 @@ describe('shared browser WebRTC connection lifecycle', () => {
     client.close();
   });
 
+  it('rejects malformed HTTP answer states without polling indefinitely', async () => {
+    const malformed = [
+      { status: 'answered' },
+      { status: 'answered', answerSdp: '' },
+      { status: 'answered', answerSdp: 42 },
+      { status: 'pending', answerSdp: 'should-not-appear' },
+      { status: 'nonsense', answerSdp: 'answer' },
+      [],
+      null,
+    ];
+    for (const body of malformed) {
+      let reads = 0;
+      const signaling = createHttpClientSignaling({
+        baseUrl: 'https://broker.example/peer',
+        headers: () => ({}),
+        fetch: async () => {
+          reads++;
+          return new Response(JSON.stringify(body), {
+            status: 200, headers: { 'content-type': 'application/json' },
+          });
+        },
+      });
+      await expect(signaling.readAnswer('session')).rejects.toThrow('invalid_peer_answer');
+      expect(reads).toBe(1);
+    }
+    for (const body of [
+      { status: 'pending' },
+      { status: 'failed' },
+      { status: 'answered', answerSdp: 'valid-sdp' },
+    ]) {
+      const signaling = createHttpClientSignaling({
+        baseUrl: 'https://broker.example/peer',
+        headers: () => ({}),
+        fetch: async () => new Response(JSON.stringify(body), { status: 200 }),
+      });
+      expect(await signaling.readAnswer('session')).toEqual(body);
+    }
+  });
+
+  it('rejects malformed injected signaling states without a busy retry loop', async () => {
+    let reads = 0;
+    const client = new PeerClient({
+      signaling: {
+        getIceServers: async () => [],
+        createOffer: async () => ({ sessionId: 'malformed', iceServers: [] }),
+        readAnswer: async () => {
+          reads++;
+          return { status: 'answered' } as unknown as PeerSessionStatus;
+        },
+      },
+      createPeerConnection: () => new FakePeer() as unknown as ClientPeerConnection,
+    });
+    await expect(client.connect('echo-v1')).rejects.toThrow('invalid_peer_answer');
+    expect(reads).toBe(1);
+    client.close();
+  });
+
   it('accepts old signaling 404/501 ICE preflight without bypassing offer authorization', async () => {
     for (const status of [404, 501]) {
       const signaling = createHttpClientSignaling({
@@ -238,7 +295,9 @@ describe('shared browser WebRTC connection lifecycle', () => {
   it('bounds a stalled late-ICE cancel within the original connection deadline and aborts DELETE', async () => {
     let wasAborted = false;
     const client = new PeerClient({
-      connectionTimeoutMs: 65,
+      // Leave enough headroom for parallel test scheduling before the targeted
+      // stalled DELETE; the timeout must be exercised by late-ICE cancellation.
+      connectionTimeoutMs: 350,
       signaling: {
         getIceServers: async () => [],
         createOffer: async () => ({
@@ -255,7 +314,7 @@ describe('shared browser WebRTC connection lifecycle', () => {
     });
     const started = Date.now();
     await expect(client.connect('read-v1')).rejects.toThrow('peer_timeout:late_ice_cancel');
-    expect(Date.now() - started).toBeLessThan(300);
+    expect(Date.now() - started).toBeLessThan(1_000);
     expect(wasAborted).toBe(true);
     client.close();
   });

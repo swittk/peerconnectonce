@@ -1,6 +1,7 @@
 import {
   isPeerLabel, readPeerIceServers,
   type PeerClientSignaling, type PeerSessionCreation, type PeerSessionStatus, type PeerIceServer,
+  type PeerHttpHeaders,
 } from '../shared/contracts.js';
 
 export type { PeerClientSignaling, PeerSessionCreation, PeerSessionStatus } from '../shared/contracts.js';
@@ -303,8 +304,16 @@ export class PeerClient {
       while (!answer) {
         const state = await underDeadline(this.signaling.readAnswer(sessionId, signal), deadline, signal, 'signal_answer');
         if (state.status === 'failed') throw new Error('peer_offer_rejected');
-        if (state.status === 'answered') answer = state.answerSdp;
-        else await underDeadline(sleep(this.answerPollIntervalMs, signal), deadline, signal, 'answer_poll');
+        if (state.status === 'answered') {
+          if (typeof state.answerSdp !== 'string' || !state.answerSdp) {
+            throw new Error('invalid_peer_answer');
+          }
+          answer = state.answerSdp;
+        } else if (state.status === 'pending') {
+          await underDeadline(sleep(this.answerPollIntervalMs, signal), deadline, signal, 'answer_poll');
+        } else {
+          throw new Error('invalid_peer_answer');
+        }
       }
       await underDeadline(peer.setRemoteDescription({ type: 'answer', sdp: answer }), deadline, signal, 'remote_description');
       await waitForChannel(peer, channel, deadline, signal);
@@ -353,7 +362,7 @@ export class PeerClient {
 
 export type HttpClientSignalingOptions = {
   baseUrl: string;
-  headers: () => HeadersInit | Promise<HeadersInit>;
+  headers: () => PeerHttpHeaders | Promise<PeerHttpHeaders>;
   fetch?: typeof fetch;
 };
 
@@ -398,8 +407,16 @@ export function createHttpClientSignaling(options: HttpClientSignalingOptions): 
     },
     async readAnswer(sessionId, signal) {
       const value = await request('/sessions/' + encodeURIComponent(sessionId), { signal });
-      if (!value || typeof (value as PeerSessionStatus).status !== 'string') throw new Error('invalid_peer_answer');
-      return value as PeerSessionStatus;
+      if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('invalid_peer_answer');
+      const status = value as { status?: unknown; answerSdp?: unknown };
+      if (status.status === 'pending' || status.status === 'failed') {
+        if (status.answerSdp !== undefined) throw new Error('invalid_peer_answer');
+        return { status: status.status };
+      }
+      if (status.status === 'answered' && typeof status.answerSdp === 'string' && status.answerSdp.length > 0) {
+        return { status: 'answered', answerSdp: status.answerSdp };
+      }
+      throw new Error('invalid_peer_answer');
     },
     async acknowledgeOffer(sessionId, signal) {
       await request('/sessions/' + encodeURIComponent(sessionId) + '/ack', { method: 'POST', signal });

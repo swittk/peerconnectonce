@@ -4,6 +4,9 @@ export const MAX_SDP_BYTES = 256 * 1024;
 export const MAX_PEER_MESSAGE_BYTES = 64 * 1024;
 export const DEFAULT_NODE_ID = 'default';
 
+/** HTTP header inputs shared by client and node adapters without DOM-only HeadersInit. */
+export type PeerHttpHeaders = Headers | Record<string, string> | [string, string][];
+
 export type PeerIceServer = {
   urls: string | string[];
   username?: string;

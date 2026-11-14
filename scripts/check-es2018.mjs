@@ -1,5 +1,6 @@
 import { readdir, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { parse } from 'acorn';
 
 /**
@@ -10,7 +11,7 @@ const manifest = JSON.parse(await readFile(new URL('../tsconfig.json', import.me
 if (manifest.compilerOptions?.target?.toUpperCase() !== 'ES2018') {
   throw new Error('The public JavaScript output target must remain ES2018 or lower');
 }
-const root = new URL('../', import.meta.url).pathname;
+const root = fileURLToPath(new URL('../', import.meta.url));
 let files = 0;
 for (const [dir, sourceType] of [['dist', 'module'], ['dist-cjs', 'script']]) {
   const pending = [join(root, dir)];
