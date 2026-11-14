@@ -66,6 +66,89 @@ describe('shared browser WebRTC connection lifecycle', () => {
     await expect(client.connect('echo-v1')).rejects.toThrow('peer_client_closed');
   });
 
+  it('aborts only a joining caller without cancelling the shared negotiation', async () => {
+    let releaseOffer: (() => void) | undefined;
+    const heldOffer = new Promise<void>((resolve) => { releaseOffer = resolve; });
+    let offers = 0;
+    const client = new PeerClient({
+      signaling: {
+        getIceServers: async () => [],
+        createOffer: async () => {
+          offers++;
+          await heldOffer;
+          return { sessionId: 'shared', iceServers: [] };
+        },
+        readAnswer: async () => ({ status: 'answered', answerSdp: 'answer' }),
+      },
+      createPeerConnection: () => new FakePeer() as unknown as ClientPeerConnection,
+    });
+    const first = client.connect('echo-v1');
+    const stopJoiner = new AbortController();
+    const joined = client.connect('echo-v1', { signal: stopJoiner.signal });
+    stopJoiner.abort();
+    await expect(joined).rejects.toThrow('peer_aborted');
+    releaseOffer?.();
+    const connected = await first;
+    expect(connected.channel.readyState).toBe('open');
+    expect(offers).toBe(1);
+    client.close();
+  });
+
+  it('cancels a late offer returned after the connection deadline', async () => {
+    let releaseOffer: ((value: { sessionId: string; iceServers: [] }) => void) | undefined;
+    let offerEntered: (() => void) | undefined;
+    const entered = new Promise<void>((resolve) => { offerEntered = resolve; });
+    const heldOffer = new Promise<{ sessionId: string; iceServers: [] }>((resolve) => { releaseOffer = resolve; });
+    const cancelled: string[] = [];
+    let wasCancelled: (() => void) | undefined;
+    const cancelledOnce = new Promise<void>((resolve) => { wasCancelled = resolve; });
+    const client = new PeerClient({
+      connectionTimeoutMs: 300,
+      signaling: {
+        getIceServers: async () => [],
+        createOffer: () => { offerEntered?.(); return heldOffer; },
+        readAnswer: async () => ({ status: 'pending' }),
+        cancelOffer: async (id) => { cancelled.push(id); wasCancelled?.(); },
+      },
+      createPeerConnection: () => new FakePeer() as unknown as ClientPeerConnection,
+    });
+    const connecting = client.connect('echo-v1');
+    await entered;
+    await expect(connecting).rejects.toThrow('peer_timeout:signal_offer');
+    releaseOffer?.({ sessionId: 'late-offer', iceServers: [] });
+    await cancelledOnce;
+    expect(cancelled).toEqual(['late-offer']);
+    client.close();
+  });
+
+  it('snapshots mutable ICE URL arrays before comparing late preflight changes', async () => {
+    const urls = ['stun:old.example'];
+    const configurations: PeerConnectionConfiguration[] = [];
+    let offers = 0;
+    const client = new PeerClient({
+      signaling: {
+        getIceServers: async () => [{ urls }],
+        createOffer: async () => {
+          offers++;
+          urls[0] = 'turn:new.example';
+          return { sessionId: 'mutable-' + offers, iceServers: [{ urls }] };
+        },
+        cancelOffer: async () => undefined,
+        readAnswer: async () => ({ status: 'answered', answerSdp: 'answer' }),
+      },
+      createPeerConnection: (config) => {
+        configurations.push(config);
+        return new FakePeer() as unknown as ClientPeerConnection;
+      },
+    });
+    const handle = await client.connect('echo-v1');
+    expect(handle.channel.readyState).toBe('open');
+    expect(offers).toBe(2);
+    expect(configurations[0]!.iceServers).toEqual([{ urls: ['stun:old.example'] }]);
+    expect(configurations[1]!.iceServers).toEqual([{ urls: ['turn:new.example'] }]);
+    client.close();
+  });
+
   it('preserves a stateful signaling instance as the acknowledgement receiver', async () => {
     class StatefulSignaling implements PeerClientSignaling {
       readonly received: string[] = [];

@@ -30,7 +30,9 @@ are never stolen. If nothing is safe to reclaim, new offers are rejected with
 a capacity error rather than disrupting existing negotiation.
 
 The runtime has bounded data-channel queues and flow control, without an arbitrary
-bandwidth limit enabled by default. A bandwidth policy is opt-in.
+bandwidth limit enabled by default. A bandwidth policy is opt-in. Adapter cleanup
+is bounded by `serviceCloseTimeoutMs` (5 seconds by default) so one stalled
+service cannot permanently occupy a peer slot.
 
 Underlying SCTP fragmentation and reassembly are delegated to Werift.
 `maxMessageBytes` rejects oversized messages **after** Werift has reassembled

@@ -43,6 +43,8 @@ export type PeerServerOptions = {
   maxPeers?: number;
   setupTimeoutMs?: number;
   idleTimeoutMs?: number;
+  /** Maximum wait for an adapter's cleanup before releasing its peer slot. */
+  serviceCloseTimeoutMs?: number;
   /** Buffered SCTP high/low cuts, not a throughput throttle. */
   bufferedHighBytes?: number;
   bufferedLowBytes?: number;
@@ -274,7 +276,7 @@ type RunningPeer = { close(): Promise<void>; readonly finished: Promise<void> };
 export class PeerServer {
   private readonly registry: PeerServiceRegistry;
   private readonly options: Required<Pick<PeerServerOptions,
-    'pollIntervalMs' | 'maxPeers' | 'setupTimeoutMs' | 'idleTimeoutMs'
+    'pollIntervalMs' | 'maxPeers' | 'setupTimeoutMs' | 'idleTimeoutMs' | 'serviceCloseTimeoutMs'
   >> & PeerServerOptions;
   private readonly livePeers = new Map<string, RunningPeer>();
   /** Reservations include peers still negotiating; Set admission is O(1). */
@@ -289,14 +291,17 @@ export class PeerServer {
       maxPeers: options.maxPeers ?? 16,
       setupTimeoutMs: options.setupTimeoutMs ?? 45_000,
       idleTimeoutMs: options.idleTimeoutMs ?? 15 * 60_000,
+      serviceCloseTimeoutMs: options.serviceCloseTimeoutMs ?? 5_000,
     };
     if (!Number.isSafeInteger(this.options.maxPeers) || this.options.maxPeers < 1 ||
         !Number.isSafeInteger(this.options.pollIntervalMs) || this.options.pollIntervalMs < 1 ||
         !Number.isSafeInteger(this.options.idleTimeoutMs) || this.options.idleTimeoutMs < 1 ||
         !Number.isSafeInteger(this.options.setupTimeoutMs) || this.options.setupTimeoutMs < 1 ||
+        !Number.isSafeInteger(this.options.serviceCloseTimeoutMs) || this.options.serviceCloseTimeoutMs < 1 ||
         this.options.pollIntervalMs > 2_147_483_647 ||
         this.options.idleTimeoutMs > 2_147_483_647 ||
-        this.options.setupTimeoutMs > 2_147_483_647)
+        this.options.setupTimeoutMs > 2_147_483_647 ||
+        this.options.serviceCloseTimeoutMs > 2_147_483_647)
       throw new Error('invalid_peer_server_limits');
     // Fail fast on invalid writer bounds before accepting an incoming peer.
     const high = options.bufferedHighBytes ?? 4 * 1024 * 1024;
@@ -417,7 +422,18 @@ export class PeerServer {
       shutdownSignal.removeEventListener('abort', onShutdown);
       void (async () => {
         try {
-          try { await session?.close(); } catch { /* best-effort service cleanup */ }
+          if (session) {
+            let closeTimer: ReturnType<typeof setTimeout> | undefined;
+            try {
+              await Promise.race([
+                Promise.resolve().then(() => session!.close()),
+                new Promise<void>((resolve) => {
+                  closeTimer = setTimeout(resolve, this.options.serviceCloseTimeoutMs);
+                }),
+              ]);
+            } catch { /* best-effort service cleanup */ }
+            finally { clearTimeout(closeTimer); }
+          }
           try { if (channel?.readyState === 'open') channel.close(); } catch { /* already closed */ }
           try { await connection.close(); } catch { /* already closed */ }
         } finally {
@@ -546,6 +562,9 @@ export type HttpNodeSignalingOptions = {
 };
 
 export function createHttpNodeSignaling(options: HttpNodeSignalingOptions): PeerNodeSignaling {
+  const requestTimeoutMs = options.requestTimeoutMs ?? 15_000;
+  if (!Number.isSafeInteger(requestTimeoutMs) || requestTimeoutMs < 1 || requestTimeoutMs > 2_147_483_647)
+    throw new Error('invalid_peer_signaling_limits');
   const fetchImpl = options.fetch ?? fetch;
   const base = options.baseUrl.replace(/\/$/, '');
   async function request(
@@ -555,7 +574,7 @@ export function createHttpNodeSignaling(options: HttpNodeSignalingOptions): Peer
     const stop = () => controller.abort();
     signal?.addEventListener('abort', stop, { once: true });
     if (signal?.aborted) controller.abort();
-    const timer = setTimeout(stop, options.requestTimeoutMs ?? 15_000);
+    const timer = setTimeout(stop, requestTimeoutMs);
     try {
       const headers = await resolvePeerHeaders(options.headers, controller.signal);
       if (body) headers.set('content-type', 'application/json');

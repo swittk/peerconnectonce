@@ -92,6 +92,65 @@ describe('real Werift server lifecycle', () => {
     }
   });
 
+  it('releases a peer slot after bounded cleanup when the service close never settles', async () => {
+    const browser = new RTCPeerConnection({ iceServers: [], iceUseDefaultStunServer: false });
+    const channel = browser.createDataChannel('echo-v1', { ordered: true });
+    await browser.setLocalDescription(await browser.createOffer());
+    const sdp = browser.localDescription?.sdp;
+    if (!sdp) throw new Error('missing_test_offer');
+    const shutdown = new AbortController();
+    let cleanupCalls = 0;
+    const server = new PeerServer({
+      iceServers: [],
+      maxPeers: 1,
+      serviceCloseTimeoutMs: 70,
+      services: [{ label: 'echo-v1', create: () => ({
+        receiveMessage() {},
+        close() { cleanupCalls++; return new Promise<void>(() => undefined); },
+      }) }],
+      signaling: {
+        claim: async () => undefined,
+        answer: async (id, answer) => {
+          if (id === 'stalled-cleanup') {
+            await browser.setRemoteDescription({ type: 'answer', sdp: answer });
+          }
+        },
+        fail: async () => undefined,
+      },
+    });
+    try {
+      const makeOffer = (sessionId: string) => ({
+        sessionId, nodeId: 'node', ownerUserId: 'alice',
+        protocol: 'echo-v1', offerSdp: sdp,
+      });
+      const first = await server.accept(makeOffer('stalled-cleanup'), shutdown.signal);
+      await Promise.race([
+        new Promise<void>((resolve) => {
+          if (channel.readyState === 'open') resolve();
+          else channel.stateChanged.subscribe((state) => { if (state === 'open') resolve(); });
+        }),
+        new Promise<never>((_resolve, reject) =>
+          setTimeout(() => reject(new Error('channel_did_not_open')), 4_000)),
+      ]);
+      const started = Date.now();
+      shutdown.abort();
+      await Promise.race([
+        first.finished,
+        new Promise<never>((_resolve, reject) =>
+          setTimeout(() => reject(new Error('cleanup_held_peer_slot')), 1_000)),
+      ]);
+      expect(Date.now() - started).toBeLessThan(1_000);
+      expect(cleanupCalls).toBe(1);
+      // A second direct accept demonstrates the maxPeers reservation was
+      // released even though the first adapter's close promise remains hung.
+      const next = await server.accept(makeOffer('next'), new AbortController().signal);
+      await next.close();
+    } finally {
+      shutdown.abort();
+      await browser.close();
+    }
+  });
+
   it('observes a rejected signaling promise when the operation aborts shutdown', async () => {
     const browser = new RTCPeerConnection({ iceServers: [], iceUseDefaultStunServer: false });
     browser.createDataChannel('echo-v1', { ordered: true });

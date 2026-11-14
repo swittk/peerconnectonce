@@ -167,6 +167,26 @@ function sameIceServers(left: PeerIceServer[], right: PeerIceServer[]): boolean 
   return true;
 }
 
+/** A joining caller can stop waiting without aborting the shared negotiation. */
+function waitForCaller<T>(work: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return work;
+  if (signal.aborted) return Promise.reject(new Error('peer_aborted'));
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const finish = (error?: Error, value?: T) => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener('abort', onAbort);
+      if (error) reject(error); else resolve(value as T);
+    };
+    const onAbort = () => finish(new Error('peer_aborted'));
+    signal.addEventListener('abort', onAbort, { once: true });
+    work.then((value) => finish(undefined, value), (reason: unknown) =>
+      finish(reason instanceof Error ? reason : new Error('peer_connection_failed')));
+    if (signal.aborted) onAbort();
+  });
+}
+
 /** Shared platform-neutral signaling/ICE/SDP/reconnect implementation for every service adapter. */
 export class PeerClient {
   private readonly signaling: PeerClientSignaling;
@@ -204,7 +224,7 @@ export class PeerClient {
     if (this.pending) {
       if (this.pendingProtocol !== protocol || this.pendingNodeId !== requestedNodeId)
         throw new Error('peer_client_in_use');
-      return this.pending;
+      return waitForCaller(this.pending, options.signal);
     }
     this.connectionAbort?.abort();
     const controller = new AbortController();
@@ -250,10 +270,9 @@ export class PeerClient {
     let established = false;
     let acknowledged = false;
     let releaseRequested = false;
-    const releaseSignaling = () => {
-      if (releaseRequested || acknowledged || !sessionId || !this.signaling.cancelOffer) return;
+    const releaseSession = (id: string) => {
+      if (releaseRequested || acknowledged || !this.signaling.cancelOffer) return;
       releaseRequested = true;
-      const id = sessionId;
       const cancelController = new AbortController();
       const cancelTimer = setTimeout(() => cancelController.abort(), 5_000);
       // Both transport cancellation and the settlement of this best-effort
@@ -265,6 +284,9 @@ export class PeerClient {
         clearTimeout(cancelTimer);
         cancelController.abort();
       });
+    };
+    const releaseSignaling = () => {
+      if (sessionId) releaseSession(sessionId);
     };
     const closeAttempt = () => {
       if (attemptClosed) return;
@@ -295,7 +317,15 @@ export class PeerClient {
       const offerSdp = peer.localDescription?.sdp;
       if (!offerSdp) throw new Error('peer_missing_local_sdp');
       const session = await underDeadline(
-        () => this.signaling.createOffer({ protocol, offerSdp, ...(nodeId ? { nodeId } : {}), signal }),
+        () => this.signaling.createOffer({ protocol, offerSdp, ...(nodeId ? { nodeId } : {}), signal })
+          .then((created) => {
+            // The host may ignore AbortSignal. A response arriving after the
+            // timeout belongs to this failed attempt and must release its row.
+            if (signal.aborted || alreadyClosed || Date.now() >= deadline) {
+              releaseSession(created.sessionId);
+            }
+            return created;
+          }),
         deadline, signal, 'signal_offer'
       );
       sessionId = session.sessionId;

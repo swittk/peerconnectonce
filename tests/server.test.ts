@@ -33,6 +33,17 @@ function channel() {
 }
 
 describe('bounded HTTP node signaling', () => {
+  it('rejects invalid request timeout configuration during adapter construction', () => {
+    for (const invalid of [0, NaN, Infinity, -1, 0.5, 3e9]) {
+      expect(() => createHttpNodeSignaling({
+        baseUrl: 'https://broker.example/peer',
+        nodeId: 'node',
+        headers: () => ({}),
+        requestTimeoutMs: invalid,
+      })).toThrow('invalid_peer_signaling_limits');
+    }
+  });
+
   it('never calls fetch if shutdown lands after header resolution but before dispatch', async () => {
     const shutdown = new AbortController();
     let fetches = 0;
@@ -197,6 +208,7 @@ describe('bounded resource configuration', () => {
     for (const invalid of [
       { maxPeers: NaN }, { maxPeers: Infinity }, { maxPeers: 0 },
       { pollIntervalMs: NaN }, { setupTimeoutMs: Infinity }, { idleTimeoutMs: 0.5 },
+      { serviceCloseTimeoutMs: NaN }, { serviceCloseTimeoutMs: 0 },
       { bufferedHighBytes: NaN }, { bufferedLowBytes: NaN },
       { maxQueuedBytes: Infinity }, { maxQueuedMessages: NaN }, { maxMessageBytes: NaN },
     ]) {

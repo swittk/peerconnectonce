@@ -69,7 +69,8 @@ export function readPeerIceServers(value: unknown): PeerIceServer[] {
     if (candidate.username !== undefined && typeof candidate.username !== 'string') throw new Error('invalid_peer_ice_config');
     if (candidate.credential !== undefined && typeof candidate.credential !== 'string') throw new Error('invalid_peer_ice_config');
     result.push({
-      urls: urls as string | string[],
+      // Snapshot mutable configuration arrays from injected signaling hosts.
+      urls: Array.isArray(urls) ? [...urls] as string[] : urls as string,
       ...(candidate.username === undefined ? {} : { username: candidate.username as string }),
       ...(candidate.credential === undefined ? {} : { credential: candidate.credential as string }),
     });
