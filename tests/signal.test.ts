@@ -4,6 +4,24 @@ import { createHttpClientSignaling } from '../src/client/index.js';
 import { createHttpNodeSignaling } from '../src/server/index.js';
 
 describe('MemoryPeerSessionStore', () => {
+  it('rejects missing, conflicting, empty and oversized terminal results without mutating the offer', () => {
+    const store = new MemoryPeerSessionStore({ createId: () => 'terminal-shape' });
+    const id = store.create({
+      nodeId: 'node-a', ownerUserId: 'alice', protocol: 'echo-v1', offerSdp: 'sdp',
+    });
+    expect(store.claim('node-a')?.sessionId).toBe(id);
+    const invalid: unknown[] = [
+      {}, { failed: false }, { answerSdp: '' }, { answerSdp: undefined },
+      { answerSdp: 123 }, { failed: true, answerSdp: 'conflict' },
+      { answerSdp: 'z'.repeat(300_000) }, null,
+    ];
+    for (const result of invalid) {
+      expect(store.answer('node-a', id, result as never)).toBe(false);
+      expect(store.read(id, 'alice')).toEqual({ status: 'pending' });
+    }
+    expect(store.answer('node-a', id, { answerSdp: 'valid-answer' })).toBe(true);
+  });
+
   it('routes one owner/protocol to the chosen node without claim or answer replay', () => {
     let now = 1_000;
     let id = 0;

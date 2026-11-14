@@ -374,7 +374,6 @@ export class PeerClient {
       established = true;
       if (this.signaling.acknowledgeOffer) {
         const id = session.sessionId;
-        const acknowledge = this.signaling.acknowledgeOffer;
         void (async () => {
           // Bound retries; an acknowledgement is idempotent and not part of
           // the service data path. If all attempts fail, cancel the signaling
@@ -386,7 +385,7 @@ export class PeerClient {
             const ackTimer = setTimeout(() => ackController.abort(), 5_000);
             try {
               await underDeadline(
-                () => acknowledge(id, ackController.signal),
+                () => this.signaling.acknowledgeOffer!(id, ackController.signal),
                 Date.now() + 5_000, ackController.signal, 'acknowledge'
               );
               acknowledged = true;

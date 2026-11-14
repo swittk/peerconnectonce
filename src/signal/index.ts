@@ -4,12 +4,17 @@ import {
 } from '../shared/contracts.js';
 export type { PeerOffer, PeerSessionStatus, PeerClientSignaling, PeerNodeSignaling } from '../shared/contracts.js';
 
+/** A terminal signaling result is exclusively a valid answer or a failure. */
+export type PeerTerminalResult =
+  | { answerSdp: string; failed?: never }
+  | { failed: true; answerSdp?: never };
+
 /** Signaling is one-shot rendezvous, not a relay for application data. */
 export type PeerSessionStore = {
   create(args: { nodeId: string; ownerUserId: string; protocol: string; offerSdp: string }): Promise<string> | string;
   read(sessionId: string, ownerUserId: string): Promise<PeerSessionStatus | undefined> | PeerSessionStatus | undefined;
   claim(nodeId: string): Promise<PeerOffer | undefined> | PeerOffer | undefined;
-  answer(nodeId: string, sessionId: string, result: { answerSdp?: string; failed?: true }): Promise<boolean> | boolean;
+  answer(nodeId: string, sessionId: string, result: PeerTerminalResult): Promise<boolean> | boolean;
   /** Receipt acknowledgement, distinct from reading or cancelling a session. */
   acknowledge(sessionId: string, ownerUserId: string): Promise<void> | void;
   cancel(sessionId: string, ownerUserId: string): Promise<void> | void;
@@ -188,11 +193,18 @@ export class MemoryPeerSessionStore implements PeerSessionStore {
     };
   }
 
-  answer(nodeId: string, sessionId: string, result: { answerSdp?: string; failed?: true }): boolean {
+  answer(nodeId: string, sessionId: string, result: PeerTerminalResult): boolean {
     this.expire();
+    // Check shape at runtime too: injected stores and JS callers can bypass
+    // TypeScript. Never mutate a claimed offer to answered-with-undefined.
+    const validFailure = result?.failed === true && result.answerSdp === undefined;
+    const validAnswer = result != null && result.failed === undefined &&
+      typeof result.answerSdp === 'string' && result.answerSdp.length > 0 &&
+      new TextEncoder().encode(result.answerSdp).byteLength <= MAX_SDP_BYTES;
+    if (!validFailure && !validAnswer) return false;
     const session = this.sessions.get(sessionId);
     if (!session || session.nodeId !== nodeId || !session.claimed || session.status.status !== 'pending') return false;
-    this.finishSession(session, result.failed
+    this.finishSession(session, validFailure
       ? { status: 'failed' } : { status: 'answered', answerSdp: result.answerSdp! });
     session.deleteAt = this.now() + this.retentionMs;
     if (session.deleteAt < this.nextSweepAtMs) this.nextSweepAtMs = session.deleteAt;

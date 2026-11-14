@@ -130,6 +130,19 @@ try {
       }, { once: true });
       opened.channel.send('ping');
     });
+    // A 32 KiB ordered message traverses many SCTP DATA fragments. The
+    // receive guard must allow complete legitimate reassembly, not merely
+    // small, single-packet signaling messages.
+    const largePayload = '0123456789abcdef'.repeat(2048);
+    const largeEcho = await new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error('fragmented_echo_timeout')), 10_000);
+      opened.channel.addEventListener('message', (event) => {
+        clearTimeout(timeout);
+        resolve(event.data);
+      }, { once: true });
+      opened.channel.send(largePayload);
+    });
+    if (largeEcho !== 'echo:' + largePayload) throw new Error('fragmented_echo_mismatch');
     const slow = await new Promise((resolve, reject) => {
       const timeout = setTimeout(() => reject(new Error('active_stream_did_not_survive_idle')), 7000);
       opened.channel.addEventListener('message', (event) => {
@@ -147,7 +160,7 @@ try {
       }, { once: true });
     });
     client.close();
-    return { message, slow, state, idleClosed, closed: opened.channel.readyState };
+    return { message, fragmentedBytes: largePayload.length, slow, state, idleClosed, closed: opened.channel.readyState };
   }, origin);
   if (result.message !== 'echo:ping' || result.slow !== 'echo:slow' ||
       result.state !== 'open' || !result.idleClosed || result.closed !== 'closed') {

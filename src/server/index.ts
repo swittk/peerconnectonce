@@ -1,4 +1,5 @@
 import { RTCPeerConnection, type RTCDataChannel } from 'werift';
+import { protectWeriftSctpReceive, type WeriftSctpReceiveSurface } from './sctpIngress.js';
 import type { PeerIceServer, PeerHttpHeaders } from '../shared/contracts.js';
 import {
   isPeerLabel, type PeerNodeSignaling, type PeerOffer,
@@ -401,6 +402,7 @@ export class PeerServer {
       };
     };
     let idleCheck: ReturnType<typeof setInterval> | undefined;
+    let disposeIngressGuard: (() => void) | undefined;
     let queuedIncomingBytes = 0;
     let queuedIncomingMessages = 0;
     let incomingTail = Promise.resolve();
@@ -421,6 +423,10 @@ export class PeerServer {
           try { if (channel?.readyState === 'open') channel.close(); } catch { /* already closed */ }
           try { await connection.close(); } catch { /* already closed */ }
         } finally {
+          // Restore Werift internals only after the closed association can no
+          // longer receive data. A rejected malicious chunk stays rejected
+          // throughout asynchronous cleanup.
+          disposeIngressGuard?.();
           this.livePeers.delete(offer.sessionId);
           this.reservedPeerIds.delete(offer.sessionId);
           finishedCallback();
@@ -494,6 +500,13 @@ export class PeerServer {
     try {
       const deadline = Date.now() + this.options.setupTimeoutMs;
       await beforeDeadline(() => connection.setRemoteDescription({ type: 'offer', sdp: offer.offerSdp }), deadline, controller.signal);
+      // Guard SCTP DATA at ingress, BEFORE fragmented reassembly and before
+      // sending the answer that allows the remote peer to transmit data.
+      disposeIngressGuard = protectWeriftSctpReceive(
+        connection as unknown as WeriftSctpReceiveSurface,
+        this.options.maxMessageBytes ?? 64 * 1024,
+        () => { void close(); },
+      );
       const answer = await beforeDeadline(() => connection.createAnswer(), deadline, controller.signal);
       await beforeDeadline(() => connection.setLocalDescription(answer), deadline, controller.signal);
       const sdp = connection.localDescription?.sdp;

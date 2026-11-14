@@ -210,6 +210,24 @@ describe('real Werift server lifecycle', () => {
         peer.finished,
         new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error('activity_probe_did_not_close')), 5_000)),
       ]);
+      if (channel.readyState !== 'closed') {
+        await new Promise<void>((resolve, reject) => {
+          let settled = false;
+          const timeout = setTimeout(() => finish(false), 5_000);
+          const subscription = channel.stateChanged.subscribe((state) => {
+            if (state === 'closed') finish(true);
+          });
+          function finish(closed: boolean) {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timeout);
+            subscription.unSubscribe();
+            if (closed) resolve();
+            else reject(new Error('remote_channel_not_closed'));
+          }
+          if (channel.readyState === 'closed') finish(true);
+        });
+      }
       expect(channel.readyState).toBe('closed');
       expect(probes).toBeGreaterThan(0);
       expect(serviceClosed).toBe(1);

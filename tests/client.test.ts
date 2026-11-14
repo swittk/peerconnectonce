@@ -66,6 +66,27 @@ describe('shared browser WebRTC connection lifecycle', () => {
     await expect(client.connect('echo-v1')).rejects.toThrow('peer_client_closed');
   });
 
+  it('preserves a stateful signaling instance as the acknowledgement receiver', async () => {
+    class StatefulSignaling implements PeerClientSignaling {
+      readonly received: string[] = [];
+      getIceServers = async () => [];
+      createOffer = async () => ({ sessionId: 'stateful', iceServers: [] });
+      readAnswer = async (): Promise<PeerSessionStatus> => ({ status: 'answered', answerSdp: 'answer' });
+      async acknowledgeOffer(id: string) {
+        this.received.push(id);
+      }
+    }
+    const signaling = new StatefulSignaling();
+    const client = new PeerClient({
+      signaling,
+      createPeerConnection: () => new FakePeer() as unknown as ClientPeerConnection,
+    });
+    await client.connect('echo-v1');
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(signaling.received).toEqual(['stateful']);
+    client.close();
+  });
+
   it('acknowledges a session only after its data channel has opened', async () => {
     const acknowledgedIds: string[] = [];
     let finishAcknowledgement: (() => void) | undefined;
