@@ -289,9 +289,12 @@ export class PeerClient {
               this.signaling.cancelOffer(supersededSessionId, cancelController.signal),
               deadline, signal, 'late_ice_cancel'
             );
-          } catch {
+          } catch (error) {
             cancelController.abort();
-            // An orphaned offer still expires under the signaling store's TTL.
+            // A failed DELETE may be fenced by the old offer's TTL, but the
+            // connection deadline and parent cancellation must never be swallowed.
+            if (signal.aborted || (error instanceof Error &&
+                error.message === 'peer_timeout:late_ice_cancel')) throw error;
           } finally {
             signal.removeEventListener('abort', cancelForParent);
           }

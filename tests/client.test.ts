@@ -294,16 +294,17 @@ describe('shared browser WebRTC connection lifecycle', () => {
 
   it('bounds a stalled late-ICE cancel within the original connection deadline and aborts DELETE', async () => {
     let wasAborted = false;
+    let offerCount = 0;
     const client = new PeerClient({
       // Leave enough headroom for parallel test scheduling before the targeted
       // stalled DELETE; the timeout must be exercised by late-ICE cancellation.
       connectionTimeoutMs: 350,
       signaling: {
         getIceServers: async () => [],
-        createOffer: async () => ({
-          sessionId: 'late-ice-offer',
-          iceServers: [{ urls: 'turn:node.example:3478' }],
-        }),
+        createOffer: async () => {
+          offerCount++;
+          return { sessionId: 'late-ice-offer', iceServers: [{ urls: 'turn:node.example:3478' }] };
+        },
         readAnswer: async () => ({ status: 'pending' }),
         cancelOffer: async (_id, signal) => {
           signal?.addEventListener('abort', () => { wasAborted = true; }, { once: true });
@@ -316,6 +317,7 @@ describe('shared browser WebRTC connection lifecycle', () => {
     await expect(client.connect('read-v1')).rejects.toThrow('peer_timeout:late_ice_cancel');
     expect(Date.now() - started).toBeLessThan(1_000);
     expect(wasAborted).toBe(true);
+    expect(offerCount).toBe(1); // timed-out cancellation must not start a second offer
     client.close();
   });
 
