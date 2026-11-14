@@ -36,10 +36,13 @@ The Node server also guards **incoming Werift 0.27 SCTP fragments before reassem
 This is distinct from the completed-message queue limits: it checks the SCTP
 receive window, an independent cumulative incomplete-message byte budget, and
 per-message fragment and size limits. A violating peer is closed. This uses
-Werift's version-specific receive interface, checked during session setup; if
-an updated Werift release no longer exposes that interface, setup fails closed
-instead of silently disabling protection. Any Werift upgrade requires re-running
-the SCTP ingress tests and browser round-trip.
+Werift 0.27.0's version-specific receive interface, checked during session setup.
+The optional server peer dependency is pinned to **exactly Werift 0.27.0**; upgrades
+require explicit review of the SCTP implementation and re-running the ingress
+regressions. An incompatible runtime receive surface fails closed rather than
+silently disabling protection. The guard uses O(1) neighboring-TSN checks to
+enforce fragment boundaries consistent with Werift's actual reassembly, and
+does not add repeated scans to incoming fragment admission.
 
 ## Development
 

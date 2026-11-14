@@ -32,9 +32,27 @@ type Association = {
 export type WeriftSctpReceiveSurface = {
   readonly sctp: { readonly sctp: Association } | null;
 };
-type TrackedMessage = { bytes: number; fragments: number };
+type TrackedMessage = { bytes: number; fragments: number; tsns: Set<number> };
 type TrackedStream = Map<number, TrackedMessage>;
+type Fragment = { streamId: number; streamSeqNum: number; flags: number };
+const DATA_FIRST = 0x02;
+const DATA_LAST = 0x01;
 const DATA_UNORDERED = 0x04; // Peer services require ordered channels.
+
+/**
+ * Werift 0.27 reassembles fragments adjacent in TSN order without checking
+ * their SSNs. Enforce SCTP DATA boundaries so distinct SSNs cannot masquerade
+ * as separate messages while Werift would combine their payloads.
+ * Called only on the two neighboring TSNs, never a scan of reassembly.
+ */
+function validBoundary(before: Fragment, after: Fragment): boolean {
+  if (before.streamId !== after.streamId) return true;
+  const beforeEnds = (before.flags & DATA_LAST) !== 0;
+  const afterStarts = (after.flags & DATA_FIRST) !== 0;
+  // A new message begins only when the previous message actually ended.
+  if (beforeEnds !== afterStarts) return false;
+  return beforeEnds || before.streamSeqNum === after.streamSeqNum;
+}
 const MAX_PARTS_PER_MESSAGE = 256;
 const MAX_TRACKED_FRAGMENTS = 2048;
 const MAX_TRACKED_STREAMS = 16;
@@ -62,6 +80,8 @@ export function protectWeriftSctpReceive(
   const original = association.receiveDataChunk;
   const maxRetainedBytes = association.advertisedRwnd;
   const tracked = new Map<number, TrackedStream>();
+  /** Each accepted incomplete DATA chunk is reachable by TSN in O(1). */
+  const fragmentsByTsn = new Map<number, Fragment>();
   let retainedBytes = 0;
   let retainedFragments = 0;
   let blocked = false;
@@ -73,6 +93,7 @@ export function protectWeriftSctpReceive(
     for (const item of messages.values()) {
       retainedFragments -= item.fragments;
       retainedBytes -= item.bytes;
+      for (const tsn of item.tsns) fragmentsByTsn.delete(tsn);
     }
     tracked.delete(streamId);
   }
@@ -95,6 +116,8 @@ export function protectWeriftSctpReceive(
     if (!item) return;
     retainedFragments -= item.fragments;
     retainedBytes -= item.bytes;
+    // One deletion per fragment at message completion; admission never scans.
+    for (const tsn of item.tsns) fragmentsByTsn.delete(tsn);
     messages!.delete(justDeliveredSeq);
     if (messages!.size === 0) tracked.delete(streamId);
   });
@@ -131,6 +154,20 @@ export function protectWeriftSctpReceive(
       try { original.call(association, chunk); } catch { violation(); }
       return;
     }
+    const fragment: Fragment = {
+      streamId: chunk.streamId,
+      streamSeqNum: chunk.streamSeqNum,
+      flags: chunk.flags,
+    };
+    const before = fragmentsByTsn.get((chunk.tsn - 1) >>> 0);
+    const after = fragmentsByTsn.get((chunk.tsn + 1) >>> 0);
+    if ((before && !validBoundary(before, fragment)) ||
+        (after && !validBoundary(fragment, after))) {
+      // In Werift, adjacent TSNs would be reassembled as the SAME message.
+      // Deny inconsistent flags/SSNs before the chunk enters its buffer.
+      violation();
+      return;
+    }
     if (size > association.advertisedRwnd || size > maxRetainedBytes - retainedBytes) {
       violation();
       return;
@@ -146,7 +183,7 @@ export function protectWeriftSctpReceive(
     }
     let item = messages.get(chunk.streamSeqNum);
     if (!item) {
-      item = { bytes: 0, fragments: 0 };
+      item = { bytes: 0, fragments: 0, tsns: new Set<number>() };
       messages.set(chunk.streamSeqNum, item);
     }
     if (size > maxMessageBytes - item.bytes ||
@@ -157,6 +194,8 @@ export function protectWeriftSctpReceive(
     }
     item.bytes += size;
     item.fragments++;
+    item.tsns.add(chunk.tsn);
+    fragmentsByTsn.set(chunk.tsn, fragment);
     retainedBytes += size;
     retainedFragments++;
     try {
@@ -174,5 +213,6 @@ export function protectWeriftSctpReceive(
     messageSub.unSubscribe();
     resetSub.unSubscribe();
     tracked.clear();
+    fragmentsByTsn.clear();
   };
 }

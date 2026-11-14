@@ -60,6 +60,104 @@ describe('Werift SCTP ingress bounds before reassembly', () => {
     });
   });
 
+  it('rejects cross-sequence fragments Werift would combine into an oversized reassembly group', async () => {
+    await withAssociation((association, peer) => {
+      let violations = 0;
+      const dispose = protectWeriftSctpReceive(
+        peer as unknown as WeriftSctpReceiveSurface, 4096,
+        () => { violations++; },
+      );
+      try {
+        // Werift uses consecutive TSNs to reassemble, even if every fragment
+        // claims a different streamSeqNum. The old per-SSN bookkeeping
+        // admitted all five 1 KiB pieces into one 5 KiB message.
+        for (let i = 1; i <= 5; i++) {
+          association.receiveDataChunk(chunk(i, 1024, 1, i - 1));
+        }
+        expect(violations).toBe(1);
+        expect(association.inboundStreams[1].reassembly.length).toBeLessThanOrEqual(4);
+      } finally { dispose(); }
+    });
+  });
+
+  it('rejects a missing earlier fragment that bridges two misleading SSNs', async () => {
+    await withAssociation((association, peer) => {
+      let violations = 0;
+      const dispose = protectWeriftSctpReceive(
+        peer as unknown as WeriftSctpReceiveSurface, 4096,
+        () => { violations++; },
+      );
+      try {
+        // Reordered arrival: TSN 3 arrives before TSN 2. Werift will later
+        // treat 1,2,3 as a single message regardless of the SSN of 3.
+        association.receiveDataChunk(chunk(1, 1024, 1, 0));
+        association.receiveDataChunk(chunk(3, 1024, 1, 1));
+        expect(violations).toBe(0);
+        association.receiveDataChunk(chunk(2, 1024, 1, 0));
+        expect(violations).toBe(1);
+      } finally { dispose(); }
+    });
+  });
+
+  it('allows consecutive complete ordered messages with different sequence numbers', async () => {
+    await withAssociation((association, peer) => {
+      let violations = 0;
+      const dispose = protectWeriftSctpReceive(
+        peer as unknown as WeriftSctpReceiveSurface, 4096,
+        () => { violations++; },
+      );
+      try {
+        association.receiveDataChunk({ ...chunk(1, 1024, 1, 0), flags: 0x03 });
+        association.receiveDataChunk({ ...chunk(2, 1024, 1, 1), flags: 0x03 });
+        expect(violations).toBe(0);
+        expect(association.advertisedRwnd).toBeGreaterThan(0);
+      } finally { dispose(); }
+    });
+  });
+
+  it('permits reordered fragments from one message and releases its quota on delivery', async () => {
+    await withAssociation((association, peer) => {
+      let violations = 0;
+      let delivered = 0;
+      const message = association.onReceive.subscribe(() => { delivered++; });
+      const dispose = protectWeriftSctpReceive(
+        peer as unknown as WeriftSctpReceiveSurface, 4096, () => { violations++; },
+      );
+      try {
+        // The network delivers TSN 2 before TSN 1, then 3 and the final 4.
+        // Same SSN throughout, and no new per-message scans are required.
+        association.receiveDataChunk(chunk(2, 1024, 1, 0));
+        association.receiveDataChunk(chunk(1, 1024, 1, 0));
+        association.receiveDataChunk(chunk(3, 1024, 1, 0));
+        association.receiveDataChunk({ ...chunk(4, 1024, 1, 0), flags: 0x01 });
+        expect(violations).toBe(0);
+        expect(delivered).toBe(1);
+        // A fresh completed message must not inherit stale retained bytes.
+        association.receiveDataChunk({ ...chunk(5, 1024, 1, 1), flags: 0x03 });
+        expect(violations).toBe(0);
+        expect(delivered).toBe(2);
+      } finally {
+        dispose();
+        message.unSubscribe();
+      }
+    });
+  });
+
+  it('detects mismatched fragment sequence numbers across 32-bit TSN wraparound', async () => {
+    await withAssociation((association, peer) => {
+      let violations = 0;
+      association.lastReceivedTsn = 0xfffffffe;
+      const dispose = protectWeriftSctpReceive(
+        peer as unknown as WeriftSctpReceiveSurface, 4096, () => { violations++; },
+      );
+      try {
+        association.receiveDataChunk({ ...chunk(0xffffffff, 1024, 1, 0), flags: 0x02 });
+        association.receiveDataChunk({ ...chunk(0, 1024, 1, 1), flags: 0 });
+        expect(violations).toBe(1);
+      } finally { dispose(); }
+    });
+  });
+
   it('rejects incoming data that exceeds the remaining advertised receive window', async () => {
     await withAssociation((association, peer) => {
       let violations = 0;
