@@ -45,6 +45,17 @@ export function isPeerLabel(value: string): boolean {
   return PEER_PROTOCOL_LABEL.test(value);
 }
 
+/**
+ * HTTP-compatible rendezvous identifiers: one nonempty URL-encodable segment
+ * of at most 128 UTF-16 code units. "." and ".." normalize as URL path
+ * traversal segments even when percent-encoded.
+ */
+export function isPeerSessionId(value: unknown): value is string {
+  if (typeof value !== 'string' || value.length < 1 || value.length > 128 ||
+      value === '.' || value === '..') return false;
+  try { encodeURIComponent(value); return true; } catch { return false; }
+}
+
 /** Accept platform-neutral ICE configuration without forcing any default STUN provider. */
 export function readPeerIceServers(value: unknown): PeerIceServer[] {
   if (!Array.isArray(value) || value.length > 16) throw new Error('invalid_peer_ice_config');

@@ -4,6 +4,28 @@ import { createHttpClientSignaling } from '../src/client/index.js';
 import { createHttpNodeSignaling } from '../src/server/index.js';
 
 describe('MemoryPeerSessionStore', () => {
+  it('refuses invalid generated session IDs before allocating or evicting store capacity', () => {
+    for (const invalid of ['.', '..', 'x'.repeat(129), '\ud800']) {
+      let next = invalid;
+      const store = new MemoryPeerSessionStore({
+        maxSessions: 1, maxSessionsPerUser: 1, maxPendingPerUser: 1,
+        createId: () => next,
+      });
+      const args = { nodeId: 'node-a', ownerUserId: 'alice', protocol: 'echo-v1', offerSdp: 'offer' };
+      expect(() => store.create(args)).toThrow('invalid_peer_session_id');
+      expect(store.claim('node-a')).toBeUndefined();
+      next = 'working-id';
+      expect(store.create(args)).toBe('working-id');
+      expect(store.claim('node-a')?.sessionId).toBe('working-id');
+      expect(store.answer('node-a', 'working-id', { failed: true })).toBe(true);
+      store.acknowledge('working-id', 'alice');
+      next = invalid;
+      expect(() => store.create(args)).toThrow('invalid_peer_session_id');
+      // An invalid replacement must not evict an acknowledged row.
+      expect(store.read('working-id', 'alice')).toEqual({ status: 'failed' });
+    }
+  });
+
   it('rejects missing, conflicting, empty and oversized terminal results without mutating the offer', () => {
     const store = new MemoryPeerSessionStore({ createId: () => 'terminal-shape' });
     const id = store.create({
@@ -229,6 +251,40 @@ describe('MemoryPeerSessionStore', () => {
 });
 
 describe('framework-neutral HTTP signaling', () => {
+  it('rejects and cleans up invalid IDs emitted by an injected store before HTTP creation succeeds', async () => {
+    for (const invalid of ['.', '..', 'x'.repeat(129)]) {
+      let occupied = false;
+      let cancelled = 0;
+      const store = {
+        create: () => { occupied = true; return invalid; },
+        cancel: (id: string, user: string) => {
+          expect(id).toBe(invalid);
+          expect(user).toBe('alice');
+          occupied = false;
+          cancelled++;
+        },
+        read: () => undefined,
+        claim: () => undefined,
+        answer: () => false,
+        acknowledge: () => undefined,
+      };
+      const handler = createPeerSignalHandler({
+        store,
+        authenticateClient: async () => ({ userId: 'alice' }),
+        authenticateNode: async () => undefined,
+        allowedProtocols: ['echo-v1'],
+        getIceServers: async () => [],
+      });
+      const response = await handler(new Request('https://broker.example/peer/sessions', {
+        method: 'POST',
+        body: JSON.stringify({ nodeId: 'node', protocol: 'echo-v1', offerSdp: 'offer' }),
+      }));
+      expect(response.status).toBe(503);
+      expect(occupied).toBe(false);
+      expect(cancelled).toBe(1);
+    }
+  });
+
   it('round-trips namespaced store IDs through read, acknowledgement and cancellation', async () => {
     const identifiers = ['offer.1', 'tenant:offer/2'];
     let next = 0;

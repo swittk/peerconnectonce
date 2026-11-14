@@ -1,5 +1,5 @@
 import {
-  DEFAULT_NODE_ID, isPeerLabel, MAX_SDP_BYTES, readPeerIceServers,
+  DEFAULT_NODE_ID, isPeerLabel, isPeerSessionId, MAX_SDP_BYTES, readPeerIceServers,
   type PeerOffer, type PeerSessionStatus, type PeerIceServer,
 } from '../shared/contracts.js';
 export type { PeerOffer, PeerSessionStatus, PeerClientSignaling, PeerNodeSignaling } from '../shared/contracts.js';
@@ -11,6 +11,7 @@ export type PeerTerminalResult =
 
 /** Signaling is one-shot rendezvous, not a relay for application data. */
 export type PeerSessionStore = {
+  /** IDs must be URL-encodable, 1–128 characters, and not "." or "..". */
   create(args: { nodeId: string; ownerUserId: string; protocol: string; offerSdp: string }): Promise<string> | string;
   read(sessionId: string, ownerUserId: string): Promise<PeerSessionStatus | undefined> | PeerSessionStatus | undefined;
   claim(nodeId: string): Promise<PeerOffer | undefined> | PeerOffer | undefined;
@@ -145,6 +146,13 @@ export class MemoryPeerSessionStore implements PeerSessionStore {
       throw new Error('peer_capacity');
     }
 
+    // Validate IDs before evicting any existing session for capacity.
+    let sessionId = this.createId();
+    if (!isPeerSessionId(sessionId)) throw new Error('invalid_peer_session_id');
+    if (this.sessions.has(sessionId)) sessionId = this.createId();
+    if (!isPeerSessionId(sessionId)) throw new Error('invalid_peer_session_id');
+    if (this.sessions.has(sessionId)) throw new Error('peer_capacity');
+
     // Under pressure, reclaim only a terminal result explicitly acknowledged
     // by its owner. Unread answers, failures and all pending offers are protected.
     // Both safe evictions are O(1) from insertion-ordered Sets.
@@ -158,9 +166,6 @@ export class MemoryPeerSessionStore implements PeerSessionStore {
       if (!oldestTerminal) throw new Error('peer_capacity');
       this.removeSession(this.sessions.get(oldestTerminal)!);
     }
-    let sessionId = this.createId();
-    if (this.sessions.has(sessionId)) sessionId = this.createId();
-    if (this.sessions.has(sessionId)) throw new Error('peer_capacity');
     const now = this.now();
     this.sessions.set(sessionId, {
       ...args, sessionId, claimed: false, acknowledged: false, status: { status: 'pending' },
@@ -368,6 +373,13 @@ export function createPeerSignalHandler(options: PeerSignalHandlerOptions): (req
           return answer({ error: 'forbidden_protocol' }, 403);
         const iceServers = readPeerIceServers(await options.getIceServers(node));
         const sessionId = await store.create({ nodeId: node, ownerUserId: user, protocol: body.protocol, offerSdp: body.offerSdp });
+        if (!isPeerSessionId(sessionId)) {
+          // The injected store has already allocated this ID. Release it
+          // before rejecting creation so it cannot strand reserved capacity.
+          try { if (typeof sessionId === 'string') await store.cancel(sessionId, user); }
+          catch { /* the backing store is unavailable; report failure below */ }
+          throw new Error('invalid_peer_session_id');
+        }
         return answer({ sessionId, iceServers }, 201);
       }
       const sessionRoute = /^sessions\/([^/]+)(\/ack)?$/.exec(route);
@@ -379,7 +391,7 @@ export function createPeerSignalHandler(options: PeerSignalHandlerOptions): (req
         let id: string;
         try { id = decodeURIComponent(sessionRoute[1]!); }
         catch { return answer({ error: 'invalid_session_id' }, 400); }
-        if (!id || id.length > 128) return answer({ error: 'invalid_session_id' }, 400);
+        if (!isPeerSessionId(id)) return answer({ error: 'invalid_session_id' }, 400);
         const user = await browserUser();
         if (!user) return answer({ error: 'unauthorized' }, 401);
         if (sessionRoute[2]) { await store.acknowledge(id, user); return empty(); }
@@ -397,8 +409,7 @@ export function createPeerSignalHandler(options: PeerSignalHandlerOptions): (req
         const node = await nodeIdentity();
         if (!node) return answer({ error: 'unauthorized' }, 401);
         const body = await readJsonBody(request);
-        if (!record(body) || typeof body.sessionId !== 'string' ||
-            body.sessionId.length === 0 || body.sessionId.length > 128 ||
+        if (!record(body) || !isPeerSessionId(body.sessionId) ||
             (typeof body.answerSdp === 'string') === (body.failed === true) ||
             (typeof body.answerSdp === 'string' && body.answerSdp.length === 0))
           return answer({ error: 'invalid_request' }, 400);
