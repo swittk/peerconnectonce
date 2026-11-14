@@ -1,7 +1,6 @@
 {
   "name": "@peerconnectonce/core",
   "version": "0.0.1",
-  "private": true,
   "license": "UNLICENSED",
   "description": "Transport-neutral peer connectivity with pluggable WebRTC clients, server runtimes and signaling.",
   "type": "module",
@@ -81,5 +80,8 @@
     "typescript": "^5.9.0",
     "vitest": "^4.0.5",
     "werift": "0.27.0"
+  },
+  "publishConfig": {
+    "access": "public"
   }
 }
